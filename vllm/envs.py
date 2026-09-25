@@ -272,6 +272,8 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
     VLLM_ALLREDUCE_PUSH_MODE: Literal["auto", "ll", "sentinel", "off"] = "auto"
     VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB: int = 256
+    VLLM_ALLREDUCE_PUSH_BLOCKS: int = 36
+    VLLM_ALLREDUCE_PUSH_FUSE_RMSNORM: bool = True
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1924,6 +1926,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buffer takes 6 * world_size times this much memory per GPU.
     "VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB": lambda: int(
         os.getenv("VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB", "256")
+    ),
+    # Grid size of the push allreduce kernels, fixed for the process lifetime.
+    "VLLM_ALLREDUCE_PUSH_BLOCKS": lambda: int(
+        os.getenv("VLLM_ALLREDUCE_PUSH_BLOCKS", "36")
+    ),
+    # With the push allreduce enabled in sentinel mode, also run the fused
+    # allreduce + residual add + RMSNorm of the allreduce fusion pass through
+    # it, instead of FlashInfer, for messages up to the push max size.
+    "VLLM_ALLREDUCE_PUSH_FUSE_RMSNORM": lambda: bool(
+        int(os.getenv("VLLM_ALLREDUCE_PUSH_FUSE_RMSNORM", "1"))
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

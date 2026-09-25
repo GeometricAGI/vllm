@@ -3112,8 +3112,34 @@ def push_buffer_size(world_size: int, max_size: int) -> int:
     return torch.ops._C_custom_ar.push_buffer_size(world_size, max_size)
 
 
-def register_push_buffers(fa: int, ipc_tensors: list[int], max_size: int) -> None:
-    torch.ops._C_custom_ar.register_push_buffers(fa, ipc_tensors, max_size)
+def register_push_buffers(
+    fa: int, ipc_tensors: list[int], max_size: int, blocks: int
+) -> None:
+    torch.ops._C_custom_ar.register_push_buffers(fa, ipc_tensors, max_size, blocks)
+
+
+def push_all_reduce_rmsnorm(
+    fa: int,
+    inp: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    norm_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    eps: float,
+    weight_bias: float = 0.0,
+    cluster_size: int = 0,
+) -> None:
+    torch.ops._C_custom_ar.push_all_reduce_rmsnorm(
+        fa,
+        inp,
+        residual,
+        gamma,
+        norm_out,
+        residual_out,
+        eps,
+        weight_bias,
+        cluster_size,
+    )
 
 
 def custom_all_gather(

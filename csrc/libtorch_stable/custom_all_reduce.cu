@@ -124,7 +124,7 @@ int64_t push_buffer_size(int64_t world_size, int64_t max_size) {
 }
 
 void register_push_buffers(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs,
-                           int64_t max_size) {
+                           int64_t max_size, int64_t blocks) {
 #if !defined(USE_ROCM)
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   STD_TORCH_CHECK(fake_ipc_ptrs.size() == fa->world_size_);
@@ -132,7 +132,7 @@ void register_push_buffers(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs,
   for (int i = 0; i < fake_ipc_ptrs.size(); i++) {
     ipc_ptrs[i] = reinterpret_cast<void*>(fake_ipc_ptrs[i]);
   }
-  fa->register_push_buffers(ipc_ptrs, max_size);
+  fa->register_push_buffers(ipc_ptrs, max_size, blocks);
 #else
   throw std::runtime_error("push allreduce is not supported on ROCm");
 #endif
@@ -182,6 +182,65 @@ void push_all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
     default:
       throw std::runtime_error(
           "push allreduce only supports float32, float16 and bfloat16");
+  }
+#else
+  throw std::runtime_error("push allreduce is not supported on ROCm");
+#endif
+}
+
+/**
+ * Sentinel push allreduce of inp fused with a residual add and RMSNorm:
+ * residual_out = allreduce(inp) + residual and norm_out = rmsnorm(
+ * residual_out) * (gamma + weight_bias). norm_out and residual_out may alias
+ * inp and residual. cluster_size is the number of blocks per row, 0 to pick
+ * one.
+ */
+void push_all_reduce_rmsnorm(fptr_t _fa, torch::stable::Tensor& inp,
+                             torch::stable::Tensor& residual,
+                             torch::stable::Tensor& gamma,
+                             torch::stable::Tensor& norm_out,
+                             torch::stable::Tensor& residual_out, double eps,
+                             double weight_bias, int64_t cluster_size) {
+#if !defined(USE_ROCM)
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      inp.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(inp.get_device_index());
+
+  const auto dtype = inp.scalar_type();
+  for (auto* t : {&residual, &gamma, &norm_out, &residual_out}) {
+    STD_TORCH_CHECK(t->scalar_type() == dtype);
+    STD_TORCH_CHECK(t->is_contiguous());
+  }
+  STD_TORCH_CHECK(inp.is_contiguous());
+  const int64_t row_size = inp.size(inp.dim() - 1);
+  const int64_t rows = inp.numel() / row_size;
+  STD_TORCH_CHECK(gamma.numel() == row_size);
+  for (auto* t : {&residual, &norm_out, &residual_out}) {
+    STD_TORCH_CHECK(t->numel() == inp.numel());
+  }
+  switch (dtype) {
+  #define PUSH_RMSNORM(T)                                                    \
+    fa->push_allreduce_rmsnorm<T>(                                           \
+        stream, reinterpret_cast<const T*>(inp.const_data_ptr()),            \
+        reinterpret_cast<const T*>(residual.const_data_ptr()),               \
+        reinterpret_cast<const T*>(gamma.const_data_ptr()),                  \
+        reinterpret_cast<T*>(norm_out.mutable_data_ptr()),                   \
+        reinterpret_cast<T*>(residual_out.mutable_data_ptr()), rows,         \
+        row_size, static_cast<float>(eps), static_cast<float>(weight_bias), \
+        cluster_size)
+    case torch::headeronly::ScalarType::Half:
+      PUSH_RMSNORM(half);
+      break;
+  #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case torch::headeronly::ScalarType::BFloat16:
+      PUSH_RMSNORM(nv_bfloat16);
+      break;
+  #endif
+  #undef PUSH_RMSNORM
+    default:
+      throw std::runtime_error(
+          "push allreduce rmsnorm only supports float16 and bfloat16");
   }
 #else
   throw std::runtime_error("push allreduce is not supported on ROCm");
