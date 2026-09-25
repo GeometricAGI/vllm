@@ -209,6 +209,23 @@ if flashinfer_comm is not None:
             if norm_out is not None:
                 norm_out = norm_out.view(-1, hidden)
         num_tokens, hidden_size = allreduce_in.shape
+        if pattern_code == ar_fusion_patterns.kARResidualRMSNorm:
+            ca_comm = getattr(get_tp_group().device_communicator, "ca_comm", None)
+            if ca_comm is not None and ca_comm.should_push_rmsnorm(
+                allreduce_in, rms_gamma
+            ):
+                # Same outputs as the FlashInfer call below: in place when
+                # norm_out is None, else residual_out goes to allreduce_in.
+                ca_comm.push_all_reduce_rmsnorm(
+                    allreduce_in,
+                    residual,
+                    rms_gamma,
+                    norm_out=allreduce_in if norm_out is None else norm_out,
+                    residual_out=residual if norm_out is None else allreduce_in,
+                    eps=rms_eps,
+                    weight_bias=weight_bias,
+                )
+                return
         element_size = allreduce_in.element_size()
         current_tensor_size = num_tokens * hidden_size * element_size
         max_tensor_size = max_token_num * hidden_size * element_size

@@ -2,6 +2,10 @@
 
 #include "custom_collective_common.cuh"
 
+#if !defined(USE_ROCM)
+  #include <cooperative_groups.h>
+#endif
+
 namespace vllm {
 
 template <typename T, int ngpus>
@@ -104,11 +108,13 @@ __global__ void __launch_bounds__(512, 1)
  * data each peer sends only after it finished epoch e, so a slot is never
  * overwritten before it has been consumed.
  */
-// Tuned on 2x H100 PCIe: larger grids only help messages above ~512KB, where
-// other allreduce kernels are as fast, at the expense of small messages.
-constexpr int kPushBlocks = 36;
+// The grid size is chosen once, at push buffer registration, and must never
+// change afterwards (see below). 36 blocks was tuned on 2x H100 PCIe: larger
+// grids only helped messages above ~512KB there.
+constexpr int kDefaultPushBlocks = 36;
 constexpr int kPushThreads = 256;
-static_assert(kPushBlocks <= kMaxPushBlocks);
+// Caps the fused kernel's blocks so every thread gets 128 registers.
+constexpr int kPushRmsnormMaxThreads = 512;
 
 struct __align__(16) PushBuffers {
   uint4* ptrs[kMaxCustomCollectiveRanks];
@@ -136,6 +142,11 @@ static DINLINE bool push_sentinel_ready(const uint4& v) {
          v.w != kPushSentinel;
 }
 
+static DINLINE uint4 push_select(bool pred, const uint4& a, const uint4& b) {
+  return make_uint4(pred ? a.x : b.x, pred ? a.y : b.y, pred ? a.z : b.z,
+                    pred ? a.w : b.w);
+}
+
 static DINLINE uint4 push_sanitize(uint4 v) {
   v.x = v.x == kPushSentinel ? 0 : v.x;
   v.y = v.y == kPushSentinel ? 0 : v.y;
@@ -148,7 +159,8 @@ static DINLINE uint4 push_sanitize(uint4 v) {
 // LL uses 2 lines per 16B pack and sentinel uses 1.
 template <typename T, int ngpus, bool Sentinel>
 __global__ void __launch_bounds__(kPushThreads, 1)
-    cross_device_reduce_push(PushBuffers bufs, Signal* self_sg,
+    cross_device_reduce_push(const __grid_constant__ PushBuffers bufs,
+                             Signal* self_sg,
                              const T* __restrict__ input,
                              T* __restrict__ result, int rank, int size,
                              int max_packs) {
@@ -174,6 +186,8 @@ __global__ void __launch_bounds__(kPushThreads, 1)
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int stride = gridDim.x * blockDim.x;
   const size_t region = static_cast<size_t>(max_packs) * kLines;
+  // bufs is a grid constant, so indexing it by rank reads param space
+  // directly instead of copying it to local memory first.
   uint4* self_buf = bufs.ptrs[rank] + parity * ngpus * region;
 
   const int first = (warp * gridDim.x + blockIdx.x) * 32 + lane;
@@ -186,13 +200,13 @@ __global__ void __launch_bounds__(kPushThreads, 1)
     const size_t dst = (parity * ngpus + rank) * region + idx * kLines;
   #pragma unroll
     for (int i = 1; i < ngpus; i++) {
-      int peer = (rank + i) % ngpus;
       if constexpr (Sentinel) {
-        st_volatile_v4(bufs.ptrs[peer] + dst, mine);
+        st_volatile_v4(bufs.ptrs[(rank + i) % ngpus] + dst, mine);
       } else {
-        st_volatile_v4(bufs.ptrs[peer] + dst,
+        uint4* peer_buf = bufs.ptrs[(rank + i) % ngpus];
+        st_volatile_v4(peer_buf + dst,
                        make_uint4(mine.x, epoch, mine.y, epoch));
-        st_volatile_v4(bufs.ptrs[peer] + dst + 1,
+        st_volatile_v4(peer_buf + dst + 1,
                        make_uint4(mine.z, epoch, mine.w, epoch));
       }
     }
@@ -200,26 +214,32 @@ __global__ void __launch_bounds__(kPushThreads, 1)
 
   // Phase 2: poll for the peers' contributions and reduce.
   for (int idx = first; idx < size; idx += stride) {
+    uint4 own = reinterpret_cast<const uint4*>(input)[idx];
+    if constexpr (Sentinel) own = push_sanitize(own);
+    // Poll all peers at once, re-reading until every slot is ready. Our own
+    // slot, never written, is read too and replaced by a select, so that got
+    // is only indexed by the unrolled r and stays in registers.
     uint4 got[ngpus];
-    got[rank] = reinterpret_cast<const uint4*>(input)[idx];
-    if constexpr (Sentinel) got[rank] = push_sanitize(got[rank]);
-    // Poll all peers at once, re-reading until every slot is ready.
     bool ready;
     do {
       ready = true;
   #pragma unroll
       for (int r = 0; r < ngpus; r++) {
-        if (r == rank) continue;
         const uint4* src = self_buf + r * region + idx * kLines;
+        uint4 v;
+        bool arrived;
         if constexpr (Sentinel) {
-          got[r] = ld_volatile_v4(src);
-          ready &= push_sentinel_ready(got[r]);
+          v = ld_volatile_v4(src);
+          arrived = push_sentinel_ready(v);
         } else {
           uint4 l0 = ld_volatile_v4(src), l1 = ld_volatile_v4(src + 1);
-          ready &=
+          arrived =
               l0.y == epoch && l0.w == epoch && l1.y == epoch && l1.w == epoch;
-          got[r] = make_uint4(l0.x, l0.z, l1.x, l1.z);
+          v = make_uint4(l0.x, l0.z, l1.x, l1.z);
         }
+        const bool mine = r == rank;
+        ready &= mine || arrived;
+        got[r] = push_select(mine, own, v);
       }
     } while (!ready);
 
@@ -244,6 +264,165 @@ __global__ void __launch_bounds__(kPushThreads, 1)
   }
 
   // Every thread has read the epoch above; publish the next one.
+  __syncthreads();
+  if (threadIdx.x == 0) *epoch_ptr = epoch;
+}
+
+/**
+ * Sentinel push allreduce fused with a residual add and RMSNorm, the push
+ * counterpart of FlashInfer's kARResidualRMSNorm allreduce fusion:
+ *   residual_out = allreduce(input) + residual
+ *   norm_out = residual_out * rsqrt(mean(residual_out^2) + eps)
+ *              * (gamma + weight_bias)
+ * with the sum, residual add and norm in fp32 and residual_out rounded only
+ * when stored. norm_out and residual_out may alias input and residual.
+ *
+ * It shares the sentinel scratch and epochs of cross_device_reduce_push,
+ * which is safe because both launch the same grid: every launch advances
+ * every block's epoch by one, and a peer only rewrites a slot two launches
+ * later, after this rank's whole grid of the launch in between has run.
+ *
+ * Each row (token) belongs to one cluster of kClusterSize blocks, each block
+ * owning a contiguous slice of the row's 16B packs, and each (row, pack)
+ * belongs to one thread both when pushing and when reducing. So a thread only
+ * overwrites input or residual elements it has already read and pushed, and
+ * the only cross-block exchange is the row's sum of squares, through
+ * distributed shared memory. The reduced fp32 row slice stays in dynamic
+ * shared memory between the sum of squares and the normalization.
+ */
+template <typename T, int ngpus, int kClusterSize>
+__global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
+    cross_device_reduce_push_rmsnorm(
+        const __grid_constant__ PushBuffers bufs, Signal* self_sg,
+        const T* input, const T* residual,
+        const T* __restrict__ gamma, T* norm_out, T* residual_out, float eps,
+        float weight_bias, int rank, int rows, int row_packs, int max_packs) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  static_assert(sizeof(P) == sizeof(uint4));
+  constexpr int kElems = P::size;
+  namespace cg = cooperative_groups;
+
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+  #endif
+  extern __shared__ float row_slice[];
+  __shared__ float warp_sums[32];
+  __shared__ float block_sum;
+
+  FlagType* epoch_ptr = &self_sg->push_epoch[true][blockIdx.x];
+  const uint32_t epoch = *epoch_ptr + 1;
+  const int parity = epoch & 1;
+  const size_t region = static_cast<size_t>(max_packs);
+  // bufs is a grid constant, so indexing it by rank reads param space
+  // directly instead of copying it to local memory first.
+  uint4* self_buf = bufs.ptrs[rank] + parity * ngpus * region;
+
+  const int slice = (row_packs + kClusterSize - 1) / kClusterSize;
+  const int cluster_rank = blockIdx.x % kClusterSize;
+  const int first_pack = cluster_rank * slice;
+  const int last_pack = min(row_packs, first_pack + slice);
+  const int first_row = blockIdx.x / kClusterSize;
+  const int row_stride = gridDim.x / kClusterSize;
+
+  // Phase 1: push every owned pack of every owned row.
+  for (int row = first_row; row < rows; row += row_stride) {
+    for (int p = first_pack + threadIdx.x; p < last_pack; p += blockDim.x) {
+      const size_t idx = static_cast<size_t>(row) * row_packs + p;
+      const uint4 mine =
+          push_sanitize(reinterpret_cast<const uint4*>(input)[idx]);
+      const size_t dst = (parity * ngpus + rank) * region + idx;
+  #pragma unroll
+      for (int i = 1; i < ngpus; i++)
+        st_volatile_v4(bufs.ptrs[(rank + i) % ngpus] + dst, mine);
+    }
+  }
+
+  // Phase 2: per row, reduce, add the residual and normalize.
+  cg::cluster_group cluster = cg::this_cluster();
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  for (int row = first_row; row < rows; row += row_stride) {
+    float sum_sq = 0.f;
+    for (int p = first_pack + threadIdx.x; p < last_pack; p += blockDim.x) {
+      const size_t idx = static_cast<size_t>(row) * row_packs + p;
+      const uint4 own =
+          push_sanitize(reinterpret_cast<const uint4*>(input)[idx]);
+      // As in cross_device_reduce_push: our own slot is read and selected
+      // away so that got stays in registers.
+      uint4 got[ngpus];
+      bool ready;
+      do {
+        ready = true;
+  #pragma unroll
+        for (int r = 0; r < ngpus; r++) {
+          const uint4 v = ld_volatile_v4(self_buf + r * region + idx);
+          const bool mine = r == rank;
+          ready &= mine || push_sentinel_ready(v);
+          got[r] = push_select(mine, own, v);
+        }
+      } while (!ready);
+      const uint4 s = make_uint4(kPushSentinel, kPushSentinel, kPushSentinel,
+                                 kPushSentinel);
+  #pragma unroll
+      for (int r = 0; r < ngpus; r++) {
+        if (r != rank) self_buf[r * region + idx] = s;
+      }
+
+      // Same rank order as cross_device_reduce_push, so every rank computes
+      // bitwise identical rows.
+      A acc = upcast(*reinterpret_cast<P*>(&got[0]));
+  #pragma unroll
+      for (int r = 1; r < ngpus; r++) {
+        packed_assign_add(acc, upcast(*reinterpret_cast<P*>(&got[r])));
+      }
+      packed_assign_add(acc,
+                        upcast(reinterpret_cast<const P*>(residual)[idx]));
+      reinterpret_cast<P*>(residual_out)[idx] = downcast<P>(acc);
+      float* stash = row_slice + (p - first_pack) * kElems;
+  #pragma unroll
+      for (int e = 0; e < kElems; e++) {
+        stash[e] = acc.data[e];
+        sum_sq += acc.data[e] * acc.data[e];
+      }
+    }
+
+    // Row sum of squares: warp, block, then cluster.
+  #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+      sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    if (lane == 0) warp_sums[warp] = sum_sq;
+    __syncthreads();
+    if (warp == 0) {
+      float v = lane < blockDim.x / 32 ? warp_sums[lane] : 0.f;
+  #pragma unroll
+      for (int offset = 16; offset > 0; offset /= 2)
+        v += __shfl_xor_sync(0xffffffff, v, offset);
+      if (lane == 0) block_sum = v;
+    }
+    cluster.sync();
+    float total = 0.f;
+  #pragma unroll
+    for (int b = 0; b < kClusterSize; b++)
+      total += *cluster.map_shared_rank(&block_sum, b);
+    const float inv_rms =
+        rsqrtf(total / static_cast<float>(row_packs * kElems) + eps);
+
+    for (int p = first_pack + threadIdx.x; p < last_pack; p += blockDim.x) {
+      const size_t idx = static_cast<size_t>(row) * row_packs + p;
+      const A w = upcast(reinterpret_cast<const P*>(gamma)[p]);
+      const float* stash = row_slice + (p - first_pack) * kElems;
+      A out;
+  #pragma unroll
+      for (int e = 0; e < kElems; e++)
+        out.data[e] = stash[e] * inv_rms * (w.data[e] + weight_bias);
+      reinterpret_cast<P*>(norm_out)[idx] = downcast<P>(out);
+    }
+    // No block may overwrite block_sum or warp_sums for the next row while
+    // a peer block still reads them.
+    cluster.sync();
+  }
+
   __syncthreads();
   if (threadIdx.x == 0) *epoch_ptr = epoch;
 }
@@ -505,6 +684,8 @@ class CustomAllreduce {
   // max_push_packs_ == 0 if they were never registered.
   PushBuffers push_ll_{}, push_sentinel_{};
   int max_push_packs_ = 0;
+  // Grid size of every push kernel, fixed at registration.
+  int push_blocks_ = kDefaultPushBlocks;
 
   static size_t push_buffer_size(int world_size, size_t max_size) {
     // [parity][rank][pack] with 2 x 16B lines per pack for LL, 1 for sentinel.
@@ -517,9 +698,14 @@ class CustomAllreduce {
    * The caller must make sure that all ranks registered before any rank
    * calls push_allreduce.
    */
-  void register_push_buffers(void** ptrs, size_t max_size) {
+  void register_push_buffers(void** ptrs, size_t max_size,
+                             int blocks = kDefaultPushBlocks) {
     if (max_size % 16 != 0)
       throw std::runtime_error("push allreduce max size must be 16B aligned");
+    if (blocks < 1 || blocks > kMaxPushBlocks)
+      throw std::runtime_error("push allreduce needs 1 to " +
+                               std::to_string(kMaxPushBlocks) + " blocks");
+    push_blocks_ = blocks;
     size_t max_packs = max_size / 16;
     size_t ll_units = 2 * world_size_ * max_packs * 2;
     for (int i = 0; i < world_size_; i++) {
@@ -557,7 +743,7 @@ class CustomAllreduce {
     cudaLaunchAttribute attributes[1]{};
     attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attributes[0].val.programmaticStreamSerializationAllowed = 1;
-    cudaLaunchConfig_t config{.gridDim = dim3(kPushBlocks),
+    cudaLaunchConfig_t config{.gridDim = dim3(push_blocks_),
                               .blockDim = dim3(kPushThreads),
                               .dynamicSmemBytes = 0,
                               .stream = stream,
@@ -592,6 +778,106 @@ class CustomAllreduce {
             "gpus = " +
             std::to_string(world_size_));
     }
+  #undef KL
+  }
+
+  /**
+   * Sentinel push allreduce fused with a residual add and RMSNorm, see
+   * cross_device_reduce_push_rmsnorm. input and residual are [rows,
+   * row_size]; norm_out and residual_out may alias them. cluster_size is
+   * the number of blocks per row, 0 to pick one.
+   */
+  template <typename T>
+  void push_allreduce_rmsnorm(cudaStream_t stream, const T* input,
+                              const T* residual, const T* gamma, T* norm_out,
+                              T* residual_out, int rows, int row_size,
+                              float eps, float weight_bias,
+                              int cluster_size = 0) {
+    constexpr int d = packed_t<T>::P::size;
+    if (row_size % d != 0)
+      throw std::runtime_error(
+          "push allreduce rmsnorm requires a row size multiple of " +
+          std::to_string(d));
+    const int row_packs = row_size / d;
+    if (static_cast<int64_t>(rows) * row_packs > max_push_packs_)
+      throw std::runtime_error(
+          "push allreduce rmsnorm input exceeds the registered scratch size");
+    if (rows == 0) return;
+    if (cluster_size == 0) {
+      // Split each row over more blocks while that leaves some idle.
+      // Initial heuristic, to be tuned on 8x B200.
+      cluster_size = 8;
+      while (cluster_size > 1 && rows * cluster_size * 2 > push_blocks_)
+        cluster_size /= 2;
+    }
+    while (push_blocks_ % cluster_size != 0) cluster_size /= 2;
+    const int slice = (row_packs + cluster_size - 1) / cluster_size;
+    const int threads = std::min(kPushRmsnormMaxThreads, (slice + 31) / 32 * 32);
+    const size_t smem = static_cast<size_t>(slice) * d * sizeof(float);
+
+    cudaLaunchAttribute attributes[2]{};
+    attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[0].val.programmaticStreamSerializationAllowed = 1;
+    attributes[1].id = cudaLaunchAttributeClusterDimension;
+    attributes[1].val.clusterDim.x = cluster_size;
+    attributes[1].val.clusterDim.y = 1;
+    attributes[1].val.clusterDim.z = 1;
+    cudaLaunchConfig_t config{.gridDim = dim3(push_blocks_),
+                              .blockDim = dim3(threads),
+                              .dynamicSmemBytes = smem,
+                              .stream = stream,
+                              .attrs = attributes,
+                              .numAttrs = 2};
+  #define KL(ngpus, cs)                                                     \
+    {                                                                       \
+      auto kernel = &cross_device_reduce_push_rmsnorm<T, ngpus, cs>;        \
+      if (smem > 48 * 1024)                                                 \
+        CUDACHECK(cudaFuncSetAttribute(                                     \
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));    \
+      CUDACHECK(cudaLaunchKernelEx(&config, kernel, push_sentinel_,         \
+                                   self_sg_, input, residual, gamma,        \
+                                   norm_out, residual_out, eps,             \
+                                   weight_bias, rank_, rows, row_packs,     \
+                                   max_push_packs_));                       \
+    }
+  #define KL_CLUSTER(ngpus)                                                  \
+    switch (cluster_size) {                                                  \
+      case 1:                                                                \
+        KL(ngpus, 1);                                                        \
+        break;                                                               \
+      case 2:                                                                \
+        KL(ngpus, 2);                                                        \
+        break;                                                               \
+      case 4:                                                                \
+        KL(ngpus, 4);                                                        \
+        break;                                                               \
+      case 8:                                                                \
+        KL(ngpus, 8);                                                        \
+        break;                                                               \
+      default:                                                               \
+        throw std::runtime_error("push allreduce rmsnorm cluster size must " \
+                                 "be 1, 2, 4 or 8");                         \
+    }
+    switch (world_size_) {
+      case 2:
+        KL_CLUSTER(2);
+        break;
+      case 4:
+        KL_CLUSTER(4);
+        break;
+      case 6:
+        KL_CLUSTER(6);
+        break;
+      case 8:
+        KL_CLUSTER(8);
+        break;
+      default:
+        throw std::runtime_error(
+            "push allreduce only supports num gpus in (2,4,6,8). Actual num "
+            "gpus = " +
+            std::to_string(world_size_));
+    }
+  #undef KL_CLUSTER
   #undef KL
   }
 #endif  // !defined(USE_ROCM)

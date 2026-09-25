@@ -385,7 +385,9 @@ class CustomAllreduce:
         self.push_ptrs = self.create_shared_buffer(
             ops.push_buffer_size(self.world_size, max_size), group=self.group
         )
-        ops.register_push_buffers(self._ptr, self.push_ptrs, max_size)
+        ops.register_push_buffers(
+            self._ptr, self.push_ptrs, max_size, envs.VLLM_ALLREDUCE_PUSH_BLOCKS
+        )
         # Peers must not push before every rank initialized its scratch.
         dist.barrier(group=self.group)
         self.push_max_size = max_size
@@ -414,6 +416,44 @@ class CustomAllreduce:
         out = torch.empty_like(inp)
         ops.push_all_reduce(self._ptr, inp, out, mode == "sentinel")
         return out
+
+    def should_push_rmsnorm(self, inp: torch.Tensor, gamma: torch.Tensor) -> bool:
+        """Whether push_all_reduce_rmsnorm takes inp, a [..., hidden] input."""
+        return (
+            envs.VLLM_ALLREDUCE_PUSH_FUSE_RMSNORM
+            and self.push_sync_mode(inp) == "sentinel"
+            and inp.dtype in (torch.float16, torch.bfloat16)
+            and gamma.dtype == inp.dtype
+            and gamma.is_contiguous()
+            and inp.shape[-1] % 8 == 0
+        )
+
+    def push_all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        norm_out: torch.Tensor,
+        residual_out: torch.Tensor,
+        eps: float,
+        weight_bias: float = 0.0,
+    ) -> None:
+        """Sentinel push allreduce of inp fused with a residual add and RMSNorm,
+        for inputs accepted by should_push_rmsnorm:
+        residual_out = allreduce(inp) + residual and
+        norm_out = rms_norm(residual_out) * (gamma + weight_bias).
+        norm_out and residual_out may alias inp and residual.
+        """
+        ops.push_all_reduce_rmsnorm(
+            self._ptr,
+            inp,
+            residual,
+            gamma,
+            norm_out,
+            residual_out,
+            eps,
+            weight_bias,
+        )
 
     @contextmanager
     def capture(self):

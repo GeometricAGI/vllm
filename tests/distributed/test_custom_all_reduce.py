@@ -9,6 +9,7 @@ import ray
 import torch
 import torch.distributed as dist
 
+from vllm import _custom_ops as ops
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  # noqa
 from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.distributed.parallel_state import get_tp_group, graph_capture
@@ -263,6 +264,113 @@ def push_allreduce(
             graph.replay()
             for inp, out in zip(inps, outs):
                 check(inp, out)
+
+
+def push_allreduce_rmsnorm(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size,
+    pp_size,
+    rank,
+    distributed_init_port,
+):
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        group = get_tp_group().device_group
+        fa = get_tp_group().device_communicator.ca_comm
+        assert fa is not None and fa.push_max_size == 1024 * 1024
+        eps = 1e-5
+
+        def make(rows, hidden, dtype, seed):
+            torch.manual_seed(seed * tp_size + rank)
+            inp = torch.randn(rows, hidden, dtype=dtype, device=device)
+            # Packed +0/-0 words collide with the sentinel.
+            inp[0, :32] = 0.0
+            inp[0, 1:32:2] = -0.0
+            # Residual and gamma must match on all ranks, as in a model.
+            torch.manual_seed(seed)
+            residual = torch.randn(rows, hidden, dtype=dtype, device=device)
+            gamma = torch.randn(hidden, dtype=dtype, device=device)
+            return inp, residual, gamma
+
+        def check(inp, residual, gamma, norm_out, residual_out, weight_bias):
+            inputs = [torch.empty_like(inp) for _ in range(tp_size)]
+            dist.all_gather(inputs, inp, group=group)
+            z = sum(x.float() for x in inputs) + residual.float()
+            # Exact: fp32 sum in rank order plus the residual, like the kernel.
+            torch.testing.assert_close(residual_out, z.to(inp.dtype), atol=0, rtol=0)
+            expected = z * torch.rsqrt(z.pow(2).mean(-1, keepdim=True) + eps)
+            expected = expected * (gamma.float() + weight_bias)
+            torch.testing.assert_close(
+                norm_out, expected.to(inp.dtype), atol=2e-2, rtol=2e-2
+            )
+            outputs = [torch.empty_like(norm_out) for _ in range(tp_size)]
+            dist.all_gather(outputs, norm_out, group=group)
+            assert all(torch.equal(outputs[0], o) for o in outputs)
+
+        # Interleave shapes, cluster sizes, in-place and out-of-place calls
+        # and the unfused push kernel, which shares the scratch and epochs.
+        shapes = [(1, 6144), (4, 6144), (37, 6144), (85, 6144), (3, 4096)]
+        rng = random.Random(0)
+        for seed, dtype in enumerate([torch.float16, torch.bfloat16] * 3):
+            for rows, hidden in rng.sample(shapes, len(shapes)):
+                inp, residual, gamma = make(rows, hidden, dtype, seed)
+                assert fa.should_push_rmsnorm(inp, gamma)
+                inp_ref, residual_ref = inp.clone(), residual.clone()
+                weight_bias = rng.choice([0.0, 1.0])
+                cluster_size = rng.choice([0, 1, 2, 4, 8])
+                if rng.random() < 0.5:
+                    norm_out, residual_out = inp, residual
+                else:
+                    norm_out = torch.empty_like(inp)
+                    residual_out = torch.empty_like(inp)
+                ops.push_all_reduce_rmsnorm(
+                    fa._ptr,
+                    inp,
+                    residual,
+                    gamma,
+                    norm_out,
+                    residual_out,
+                    eps,
+                    weight_bias,
+                    cluster_size,
+                )
+                check(inp_ref, residual_ref, gamma, norm_out, residual_out, weight_bias)
+                out = tensor_model_parallel_all_reduce(inp_ref)
+                torch.testing.assert_close(
+                    out, sum_over_ranks(inp_ref, group, tp_size), atol=0, rtol=0
+                )
+
+        inp, residual, gamma = make(4, 6144, torch.bfloat16, 0)
+        norm_out = torch.empty_like(inp)
+        with graph_capture(device=device) as graph_capture_context:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=graph_capture_context.stream):
+                fa.push_all_reduce_rmsnorm(inp, residual, gamma, norm_out, inp, eps)
+        for step in range(10):
+            new_inp, new_residual, _ = make(4, 6144, torch.bfloat16, step)
+            inp.copy_(new_inp)
+            residual.copy_(new_residual)
+            graph.replay()
+            check(new_inp, new_residual, gamma, norm_out, inp, 0.0)
+
+
+def sum_over_ranks(inp, group, tp_size):
+    inputs = [torch.empty_like(inp) for _ in range(tp_size)]
+    dist.all_gather(inputs, inp, group=group)
+    return sum(x.float() for x in inputs).to(inp.dtype)
+
+
+@pytest.mark.parametrize("tp_size", [2, 8])
+def test_push_allreduce_rmsnorm(monkeypatch: pytest.MonkeyPatch, tp_size):
+    if torch.accelerator.device_count() < tp_size:
+        pytest.skip("Not enough GPUs to run the test.")
+    monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MODE", "sentinel")
+    monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB", "1024")
+    multi_process_parallel(monkeypatch, tp_size, 1, push_allreduce_rmsnorm)
 
 
 @pytest.mark.parametrize("mode", ["ll", "sentinel"])
