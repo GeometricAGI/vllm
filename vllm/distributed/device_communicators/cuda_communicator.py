@@ -267,6 +267,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
+            "CUSTOM_PUSH",
             "FLASHINFER_PCIE_IPC",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
@@ -277,6 +278,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        if (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.push_max_size > 0
+        ):
+            enabled_ar_backends.append("CUSTOM_PUSH")
         if (
             self.fi_pcie_ipc_ar_comm is not None
             and not self.fi_pcie_ipc_ar_comm.disabled
@@ -333,6 +340,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        # The barrier-free push allreduce is only enabled where it was
+        # measured to beat the backends below for small messages.
+        push_mode = self.ca_comm.push_sync_mode(input_) if self.ca_comm else None
+        if push_mode is not None:
+            assert self.ca_comm is not None
+            return self.ca_comm.push_all_reduce(input_, push_mode)
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None

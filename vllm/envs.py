@@ -270,6 +270,8 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
+    VLLM_ALLREDUCE_PUSH_MODE: Literal["auto", "ll", "sentinel", "off"] = "auto"
+    VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB: int = 256
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1908,6 +1910,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # integration is being qualified.
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
+    ),
+    # Barrier-free one-shot push allreduce of the custom allreduce backend
+    # (arXiv:2607.16100), tried before all other allreduce backends for
+    # messages up to VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB. "ll" packs a flag with
+    # every 4 bytes of payload, "sentinel" polls for a sentinel value to be
+    # overwritten, "off" disables it and "auto" uses sentinel sync on GPUs
+    # connected over PCIe only.
+    "VLLM_ALLREDUCE_PUSH_MODE": env_with_choices(
+        "VLLM_ALLREDUCE_PUSH_MODE", "auto", ["auto", "ll", "sentinel", "off"]
+    ),
+    # Largest message (KiB) sent through the push allreduce. Its scratch
+    # buffer takes 6 * world_size times this much memory per GPU.
+    "VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB": lambda: int(
+        os.getenv("VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB", "256")
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

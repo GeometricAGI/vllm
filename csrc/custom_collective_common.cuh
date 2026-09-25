@@ -34,6 +34,9 @@ constexpr int kMaxCustomCollectiveRanks = 16;
 // Maximal number of blocks in allreduce kernel.
 constexpr int kMaxBlocks = 36;
 
+// Maximal number of blocks in the push allreduce kernel.
+constexpr int kMaxPushBlocks = 128;
+
 // Default number of blocks in allreduce kernel.
 #ifndef USE_ROCM
 inline constexpr int defaultBlockLimit = 36;
@@ -59,6 +62,9 @@ struct Signal {
   alignas(128) FlagType start[kMaxBlocks][kMaxCustomCollectiveRanks];
   alignas(128) FlagType end[kMaxBlocks][kMaxCustomCollectiveRanks];
   alignas(128) FlagType _flag[kMaxBlocks];  // incremental flags for each rank
+  // Per-block epochs of the barrier-free push allreduce, one row per sync
+  // mode (LL flags, sentinel). Only ever touched by the local GPU.
+  alignas(128) FlagType push_epoch[2][kMaxPushBlocks];
 };
 
 struct __align__(16) RankData {

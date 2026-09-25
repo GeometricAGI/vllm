@@ -1098,6 +1098,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
   custom_ar.def(
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "push_all_reduce(int fa, Tensor inp, Tensor! out, bool sentinel) -> ()");
+  custom_ar.def("push_buffer_size(int world_size, int max_size) -> int");
+  custom_ar.def(
+      "register_push_buffers(int fa, int[] ipc_tensors, int max_size) -> ()");
   custom_ar.def("dispose(int fa) -> ()");
   custom_ar.def("meta_size() -> int");
   custom_ar.def("register_buffer(int fa, int[] ipc_tensors) -> ()");
@@ -1112,6 +1117,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ar) {
   custom_ar.impl("init_custom_ar", TORCH_BOX(&init_custom_ar));
   custom_ar.impl("all_reduce", TORCH_BOX(&all_reduce));
+  custom_ar.impl("push_all_reduce", TORCH_BOX(&push_all_reduce));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CPU, custom_ar) {
@@ -1121,6 +1127,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CPU, custom_ar) {
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CompositeExplicitAutograd, custom_ar) {
   custom_ar.impl("dispose", TORCH_BOX(&dispose));
   custom_ar.impl("meta_size", TORCH_BOX(&meta_size));
+  custom_ar.impl("push_buffer_size", TORCH_BOX(&push_buffer_size));
+  custom_ar.impl("register_push_buffers", TORCH_BOX(&register_push_buffers));
   custom_ar.impl("register_buffer", TORCH_BOX(&register_buffer));
   custom_ar.impl("get_graph_buffer_ipc_meta",
                  TORCH_BOX(&get_graph_buffer_ipc_meta));
