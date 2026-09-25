@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
-from typing import cast
+from typing import Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -154,6 +154,8 @@ class CustomAllreduce:
         self.mnnvl_lamport_ag_epoch_ptr = 0
         self.mnnvl_lamport_rs_epoch_ptr = 0
         self.mnnvl_only = False
+        self.push_ptrs: list[int] | None = None
+        self.push_max_size = 0
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -301,6 +303,8 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
+        if same_node:
+            self._init_push_buffers()
         self._init_mnnvl_buffer(
             max(
                 max_mnnvl_all_gather_size * world_size,
@@ -367,6 +371,49 @@ class CustomAllreduce:
             self.mnnvl_lamport_rs_epoch_ptr = epochs[1].data_ptr()
         except RuntimeError as error:
             logger.debug("MNNVL AG/RS initialization failed: %s", error)
+
+    def _init_push_buffers(self):
+        """Set up the barrier-free push allreduce (arXiv:2607.16100)."""
+        max_size = envs.VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB * 1024
+        mode = envs.VLLM_ALLREDUCE_PUSH_MODE
+        if not current_platform.is_cuda() or mode == "off" or max_size <= 0:
+            return
+        # "auto" only enables it on PCIe, where it was measured (2x H100) to
+        # beat the FlashInfer and 1-stage allreduce up to the default max size.
+        if mode == "auto" and self.fully_connected:
+            return
+        self.push_ptrs = self.create_shared_buffer(
+            ops.push_buffer_size(self.world_size, max_size), group=self.group
+        )
+        ops.register_push_buffers(self._ptr, self.push_ptrs, max_size)
+        # Peers must not push before every rank initialized its scratch.
+        dist.barrier(group=self.group)
+        self.push_max_size = max_size
+
+    def push_sync_mode(self, inp: torch.Tensor) -> Literal["ll", "sentinel"] | None:
+        """The sync mode of the push allreduce for inp, None if not used."""
+        inp_size = inp.numel() * inp.element_size()
+        if (
+            self.disabled
+            or inp_size > self.push_max_size
+            or not self.should_custom_ar(inp)
+        ):
+            return None
+        mode = envs.VLLM_ALLREDUCE_PUSH_MODE
+        # Over PCIe, sentinel sync beat LL at every size down to 128B.
+        return "sentinel" if mode == "auto" else mode
+
+    def push_all_reduce(
+        self, inp: torch.Tensor, mode: Literal["ll", "sentinel"]
+    ) -> torch.Tensor:
+        """Out-of-place push allreduce, for inputs accepted by push_sync_mode.
+
+        It reads inp in place, so unlike all_reduce it needs neither IPC
+        registration nor a staging copy, also during graph capture.
+        """
+        out = torch.empty_like(inp)
+        ops.push_all_reduce(self._ptr, inp, out, mode == "sentinel")
+        return out
 
     @contextmanager
     def capture(self):
@@ -568,6 +615,9 @@ class CustomAllreduce:
             self._ptr = 0
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
+            if self.push_ptrs is not None:
+                self.free_shared_buffer(self.push_ptrs, rank=self.rank)
+                self.push_ptrs = None
             self.mnnvl_peer_buffers = None
             self.mnnvl_handle = None
             self.mnnvl_buffer = None

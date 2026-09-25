@@ -115,6 +115,79 @@ void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
   }
 }
 
+int64_t push_buffer_size(int64_t world_size, int64_t max_size) {
+#if !defined(USE_ROCM)
+  return vllm::CustomAllreduce::push_buffer_size(world_size, max_size);
+#else
+  throw std::runtime_error("push allreduce is not supported on ROCm");
+#endif
+}
+
+void register_push_buffers(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs,
+                           int64_t max_size) {
+#if !defined(USE_ROCM)
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  STD_TORCH_CHECK(fake_ipc_ptrs.size() == fa->world_size_);
+  void* ipc_ptrs[vllm::kMaxCustomCollectiveRanks];
+  for (int i = 0; i < fake_ipc_ptrs.size(); i++) {
+    ipc_ptrs[i] = reinterpret_cast<void*>(fake_ipc_ptrs[i]);
+  }
+  fa->register_push_buffers(ipc_ptrs, max_size);
+#else
+  throw std::runtime_error("push allreduce is not supported on ROCm");
+#endif
+}
+
+/**
+ * Barrier-free push allreduce (LL or sentinel sync) from inp into out, which
+ * must not overlap. inp needs no IPC registration, also under CUDA graph
+ * capture.
+ */
+void push_all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
+                     torch::stable::Tensor& out, bool sentinel) {
+#if !defined(USE_ROCM)
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      inp.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(inp.get_device_index());
+
+  STD_TORCH_CHECK((inp.scalar_type()) == (out.scalar_type()));
+  STD_TORCH_CHECK((inp.numel()) == (out.numel()));
+  STD_TORCH_CHECK(_is_weak_contiguous(out));
+  STD_TORCH_CHECK(_is_weak_contiguous(inp));
+  switch (out.scalar_type()) {
+    case torch::headeronly::ScalarType::Float: {
+      fa->push_allreduce<float>(
+          stream, reinterpret_cast<const float*>(inp.const_data_ptr()),
+          reinterpret_cast<float*>(out.mutable_data_ptr()), out.numel(),
+          sentinel);
+      break;
+    }
+    case torch::headeronly::ScalarType::Half: {
+      fa->push_allreduce<half>(
+          stream, reinterpret_cast<const half*>(inp.const_data_ptr()),
+          reinterpret_cast<half*>(out.mutable_data_ptr()), out.numel(),
+          sentinel);
+      break;
+    }
+  #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case torch::headeronly::ScalarType::BFloat16: {
+      fa->push_allreduce<nv_bfloat16>(
+          stream, reinterpret_cast<const nv_bfloat16*>(inp.const_data_ptr()),
+          reinterpret_cast<nv_bfloat16*>(out.mutable_data_ptr()), out.numel(),
+          sentinel);
+      break;
+    }
+  #endif
+    default:
+      throw std::runtime_error(
+          "push allreduce only supports float32, float16 and bfloat16");
+  }
+#else
+  throw std::runtime_error("push allreduce is not supported on ROCm");
+#endif
+}
+
 void dispose(fptr_t _fa) {
   delete reinterpret_cast<vllm::CustomAllreduce*>(_fa);
 }

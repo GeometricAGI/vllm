@@ -522,6 +522,12 @@ void mnnvl_lamport_reduce_scatter(fptr_t _fa, torch::stable::Tensor& inp,
                                   torch::stable::Tensor& out,
                                   fptr_t local_buffer, fptr_t epoch_buffer,
                                   int64_t stage_sz_bytes);
+int64_t push_buffer_size(int64_t world_size, int64_t max_size);
+void register_push_buffers(fptr_t _fa,
+                           const std::vector<int64_t>& fake_ipc_ptrs,
+                           int64_t max_size);
+void push_all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
+                     torch::stable::Tensor& out, bool sentinel);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);

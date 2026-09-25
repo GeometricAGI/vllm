@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import random
 
 import pytest
@@ -200,6 +201,77 @@ def eager_allreduce(
         for _ in range(num_communication):
             out = fa.all_reduce(out, registered=False)
         torch.testing.assert_close(out, inp * (tp_size**num_communication))
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def push_allreduce(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size,
+    pp_size,
+    rank,
+    distributed_init_port,
+):
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        mode = os.environ["VLLM_ALLREDUCE_PUSH_MODE"]
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+        ensure_model_parallel_initialized(tp_size, pp_size)
+        group = get_tp_group().device_group
+        fa = get_tp_group().device_communicator.ca_comm
+        assert fa is not None and fa.push_max_size == 1024 * 1024
+
+        def check(inp, out):
+            # Exact reference: fp32 sum in rank order, like the kernel.
+            inputs = [torch.empty_like(inp) for _ in range(tp_size)]
+            dist.all_gather(inputs, inp, group=group)
+            expected = sum(x.float() for x in inputs).to(inp.dtype)
+            torch.testing.assert_close(out, expected, atol=0, rtol=0)
+            outputs = [torch.empty_like(out) for _ in range(tp_size)]
+            dist.all_gather(outputs, out, group=group)
+            assert all(torch.equal(outputs[0], o) for o in outputs)
+
+        def make_input(n, dtype, seed):
+            torch.manual_seed(seed * tp_size + rank)
+            inp = torch.randn(n, dtype=dtype, device=device)
+            # Packed +0/-0 words collide with the sentinel.
+            inp[:32] = 0.0
+            inp[1:32:2] = -0.0
+            return inp
+
+        # Interleave sizes, dtypes and the 1-stage kernel to exercise the
+        # double-buffered scratch and the device-side epochs.
+        sizes = [8, 4096, 8 * 4096 + 64, 256 * 1024, 512 * 1024]
+        for seed, dtype in enumerate([torch.float32, torch.float16, torch.bfloat16]):
+            for n in random.Random(seed).sample(sizes, len(sizes)):
+                inp = make_input(n, dtype, seed)
+                if inp.nbytes > fa.push_max_size:
+                    continue
+                assert fa.push_sync_mode(inp) == mode
+                check(inp, tensor_model_parallel_all_reduce(inp))
+                fa.all_reduce(inp, registered=False)
+
+        inps = [make_input(n, torch.bfloat16, 0) for n in sizes[:-1]]
+        with graph_capture(device=device) as graph_capture_context:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=graph_capture_context.stream):
+                outs = [tensor_model_parallel_all_reduce(inp) for inp in inps]
+        for step in range(10):
+            for i, inp in enumerate(inps):
+                inp.copy_(make_input(inp.numel(), inp.dtype, step * 10 + i))
+            graph.replay()
+            for inp, out in zip(inps, outs):
+                check(inp, out)
+
+
+@pytest.mark.parametrize("mode", ["ll", "sentinel"])
+def test_push_allreduce(monkeypatch: pytest.MonkeyPatch, mode):
+    if torch.accelerator.device_count() < 2:
+        pytest.skip("Not enough GPUs to run the test.")
+    monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MODE", mode)
+    monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB", "1024")
+    multi_process_parallel(monkeypatch, 2, 1, push_allreduce)
 
 
 @pytest.mark.parametrize("tp_size", [2])
