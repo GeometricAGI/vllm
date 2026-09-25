@@ -271,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_PUSH_BLOCKS: int = 36
     VLLM_ALLREDUCE_PUSH_FUSE_RMSNORM: bool = True
     VLLM_ALLREDUCE_PUSH_TWO_SHOT_MIN_KB: int = 512
+    VLLM_ALLREDUCE_PUSH_MULTICAST: bool = True
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1900,6 +1901,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one-shot only, so it stops below this size.
     "VLLM_ALLREDUCE_PUSH_TWO_SHOT_MIN_KB": lambda: int(
         os.getenv("VLLM_ALLREDUCE_PUSH_TWO_SHOT_MIN_KB", "512")
+    ),
+    # Allocate the push scratch as multicast symmetric memory where the GPUs
+    # support it (NVSwitch), so the fused push kernels send each pack once
+    # with a multimem store instead of once per peer.
+    "VLLM_ALLREDUCE_PUSH_MULTICAST": lambda: bool(
+        int(os.getenv("VLLM_ALLREDUCE_PUSH_MULTICAST", "1"))
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

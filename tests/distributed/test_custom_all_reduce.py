@@ -282,6 +282,11 @@ def push_allreduce_rmsnorm(
         group = get_tp_group().device_group
         fa = get_tp_group().device_communicator.ca_comm
         assert fa is not None and fa.push_max_size == 2048 * 1024
+        if os.environ["VLLM_ALLREDUCE_PUSH_MULTICAST"] == "1":
+            # Otherwise the multicast kernels would silently not be tested.
+            assert fa.push_symm == car._has_local_multicast_support(device)
+        else:
+            assert not fa.push_symm
         eps = 1e-5
 
         def make(rows, hidden, dtype, seed):
@@ -410,11 +415,15 @@ def sum_over_ranks(inp, group, tp_size):
 
 
 @pytest.mark.parametrize("tp_size", [2, 8])
-def test_push_allreduce_rmsnorm(monkeypatch: pytest.MonkeyPatch, tp_size):
+@pytest.mark.parametrize("multicast", [False, True])
+def test_push_allreduce_rmsnorm(
+    monkeypatch: pytest.MonkeyPatch, tp_size, multicast
+):
     if torch.accelerator.device_count() < tp_size:
         pytest.skip("Not enough GPUs to run the test.")
     monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MODE", "sentinel")
     monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB", "2048")
+    monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MULTICAST", str(int(multicast)))
     multi_process_parallel(monkeypatch, tp_size, 1, push_allreduce_rmsnorm)
 
 

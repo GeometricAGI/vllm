@@ -124,7 +124,8 @@ int64_t push_buffer_size(int64_t world_size, int64_t max_size) {
 }
 
 void register_push_buffers(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs,
-                           int64_t max_size, int64_t blocks) {
+                           int64_t max_size, int64_t blocks,
+                           int64_t multicast_ptr) {
 #if !defined(USE_ROCM)
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   STD_TORCH_CHECK(fake_ipc_ptrs.size() == fa->world_size_);
@@ -132,7 +133,8 @@ void register_push_buffers(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs,
   for (int i = 0; i < fake_ipc_ptrs.size(); i++) {
     ipc_ptrs[i] = reinterpret_cast<void*>(fake_ipc_ptrs[i]);
   }
-  fa->register_push_buffers(ipc_ptrs, max_size, blocks);
+  fa->register_push_buffers(ipc_ptrs, max_size, blocks,
+                            reinterpret_cast<void*>(multicast_ptr));
 #else
   throw std::runtime_error("push allreduce is not supported on ROCm");
 #endif

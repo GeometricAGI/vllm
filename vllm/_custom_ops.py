@@ -3190,9 +3190,15 @@ def push_buffer_size(world_size: int, max_size: int) -> int:
 
 
 def register_push_buffers(
-    fa: int, ipc_tensors: list[int], max_size: int, blocks: int
+    fa: int,
+    ipc_tensors: list[int],
+    max_size: int,
+    blocks: int,
+    multicast_ptr: int = 0,
 ) -> None:
-    torch.ops._C_custom_ar.register_push_buffers(fa, ipc_tensors, max_size, blocks)
+    torch.ops._C_custom_ar.register_push_buffers(
+        fa, ipc_tensors, max_size, blocks, multicast_ptr
+    )
 
 
 def push_all_reduce_rmsnorm(

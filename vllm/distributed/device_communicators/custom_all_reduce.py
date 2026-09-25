@@ -155,6 +155,12 @@ class CustomAllreduce:
         self.mnnvl_lamport_rs_epoch_ptr = 0
         self.mnnvl_only = False
         self.push_ptrs: list[int] | None = None
+        # Set when push_ptrs are torch symmetric memory with a multicast
+        # address, which the handle and buffer keep alive.
+        self.push_symm = False
+        self.push_symm_handle = None
+        self.push_symm_buffer: torch.Tensor | None = None
+        self.push_symm_peer_buffers: list[torch.Tensor] | None = None
         self.push_max_size = 0
 
         if not custom_ar:
@@ -382,15 +388,50 @@ class CustomAllreduce:
         # beat the FlashInfer and 1-stage allreduce up to the default max size.
         if mode == "auto" and self.fully_connected:
             return
-        self.push_ptrs = self.create_shared_buffer(
-            ops.push_buffer_size(self.world_size, max_size), group=self.group
-        )
+        size = ops.push_buffer_size(self.world_size, max_size)
+        multicast_ptr = 0
+        if envs.VLLM_ALLREDUCE_PUSH_MULTICAST and _has_local_multicast_support(
+            self.device
+        ):
+            multicast_ptr = self._init_push_multicast_buffers(size)
+        if not multicast_ptr:
+            self.push_ptrs = self.create_shared_buffer(size, group=self.group)
+        assert self.push_ptrs is not None
         ops.register_push_buffers(
-            self._ptr, self.push_ptrs, max_size, envs.VLLM_ALLREDUCE_PUSH_BLOCKS
+            self._ptr,
+            self.push_ptrs,
+            max_size,
+            envs.VLLM_ALLREDUCE_PUSH_BLOCKS,
+            multicast_ptr,
         )
         # Peers must not push before every rank initialized its scratch.
         dist.barrier(group=self.group)
         self.push_max_size = max_size
+
+    def _init_push_multicast_buffers(self, size: int) -> int:
+        """Allocate the push scratch as symmetric memory with a multicast
+        address, setting push_ptrs; returns that address, or 0 if the group
+        has none (then nothing is kept)."""
+        assert torch_symm_mem is not None
+        try:
+            # Zeroed, as register_push_buffers expects of the LL region.
+            buffer = torch_symm_mem.empty(size, dtype=torch.uint8, device=self.device)
+            buffer.zero_()
+            handle = torch_symm_mem.rendezvous(buffer, self.group.group_name)
+        except RuntimeError as error:
+            logger.debug("Push allreduce multicast allocation failed: %s", error)
+            return 0
+        if handle.multicast_ptr == 0:
+            return 0
+        self.push_symm_buffer = buffer
+        self.push_symm_handle = handle
+        self.push_symm_peer_buffers = [
+            handle.get_buffer(peer, (size,), torch.uint8, storage_offset=0)
+            for peer in range(self.world_size)
+        ]
+        self.push_ptrs = [b.data_ptr() for b in self.push_symm_peer_buffers]
+        self.push_symm = True
+        return handle.multicast_ptr
 
     def push_sync_mode(
         self, inp: torch.Tensor, fused: bool = False
@@ -666,9 +707,12 @@ class CustomAllreduce:
             self._ptr = 0
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
-            if self.push_ptrs is not None:
+            if self.push_ptrs is not None and not self.push_symm:
                 self.free_shared_buffer(self.push_ptrs, rank=self.rank)
-                self.push_ptrs = None
+            self.push_ptrs = None
+            self.push_symm_peer_buffers = None
+            self.push_symm_handle = None
+            self.push_symm_buffer = None
             self.mnnvl_peer_buffers = None
             self.mnnvl_handle = None
             self.mnnvl_buffer = None

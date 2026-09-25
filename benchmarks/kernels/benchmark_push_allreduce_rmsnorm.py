@@ -8,10 +8,10 @@ default), and with an unfused allreduce (push, custom 1-stage, NCCL) followed
 by vLLM's fused_add_rms_norm. Run one process per GPU:
 
     python benchmarks/kernels/benchmark_push_allreduce_rmsnorm.py \
-        --world-size 8 --hidden 6144 --push-blocks 36 64 128
+        --world-size 8 --hidden 6144 --push-blocks 36 64 128 --multicast 1 0
 
-Each --push-blocks value is a separate run, because the push grid size is
-fixed for the lifetime of a process.
+Each (--push-blocks, --multicast) pair is a separate run, because the push
+grid size and scratch allocation are fixed for the lifetime of a process.
 """
 
 import argparse
@@ -113,11 +113,14 @@ def check(ca, group, world_size, tokens, hidden, cluster, in_place, two_shot, de
     )
 
 
-def worker(rank: int, args, push_blocks: int, port: int, out_q) -> None:
+def worker(
+    rank: int, args, push_blocks: int, multicast: int, port: int, out_q
+) -> None:
     os.environ.update(
         VLLM_ALLREDUCE_PUSH_MODE="sentinel",
         VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB=str(args.push_max_kb),
         VLLM_ALLREDUCE_PUSH_BLOCKS=str(push_blocks),
+        VLLM_ALLREDUCE_PUSH_MULTICAST=str(multicast),
     )
     device = torch.device(f"cuda:{rank}")
     torch.accelerator.set_device_index(device)
@@ -132,6 +135,7 @@ def worker(rank: int, args, push_blocks: int, port: int, out_q) -> None:
     comm = tp.device_communicator
     ca = comm.ca_comm
     assert ca is not None and ca.push_max_size > 0, "push allreduce not enabled"
+    assert ca.push_symm == bool(multicast), "multicast scratch not as requested"
 
     from vllm.compilation.passes.fusion import allreduce_rms_fusion as arf
 
@@ -159,7 +163,10 @@ def worker(rank: int, args, push_blocks: int, port: int, out_q) -> None:
                         n += 1
         torch.accelerator.synchronize()
         if rank == 0:
-            print(f"push_blocks={push_blocks}: {n} correctness checks passed")
+            print(
+                f"push_blocks={push_blocks} multicast={multicast}: "
+                f"{n} correctness checks passed"
+            )
 
     dtype = torch.bfloat16
     gamma = torch.randn(args.hidden, dtype=dtype, device=device)
@@ -245,6 +252,7 @@ def worker(rank: int, args, push_blocks: int, port: int, out_q) -> None:
                 for k, v in row.items()
             }
             merged["push_blocks"] = push_blocks
+            merged["multicast"] = multicast
             results.append(merged)
     if rank == 0:
         out_q.put(results)
@@ -263,6 +271,14 @@ def main() -> None:
         default=[1, 2, 4, 8, 16, 32, 48, 64, 85, 128, 170],
     )
     parser.add_argument("--push-blocks", type=int, nargs="+", default=[36])
+    parser.add_argument(
+        "--multicast",
+        type=int,
+        nargs="+",
+        default=[1, 0],
+        choices=[0, 1],
+        help="push scratch with (1) or without (0) a multicast address",
+    )
     parser.add_argument("--push-max-kb", type=int, default=2048)
     parser.add_argument("--fi-max-tokens", type=int, default=2048)
     parser.add_argument("--inner", type=int, default=50)
@@ -275,10 +291,13 @@ def main() -> None:
 
     ctx = mp.get_context("spawn")
     all_results = []
-    for i, push_blocks in enumerate(args.push_blocks):
+    runs = [(b, m) for b in args.push_blocks for m in args.multicast]
+    for i, (push_blocks, multicast) in enumerate(runs):
         q = ctx.Queue()
         procs = [
-            ctx.Process(target=worker, args=(r, args, push_blocks, 29500 + i, q))
+            ctx.Process(
+                target=worker, args=(r, args, push_blocks, multicast, 29500 + i, q)
+            )
             for r in range(args.world_size)
         ]
         for p in procs:
@@ -288,14 +307,17 @@ def main() -> None:
             p.join()
             assert p.exitcode == 0, f"worker exited with {p.exitcode}"
 
-    keys = [k for k in all_results[0] if k not in ("tokens", "kib", "push_blocks")]
+    meta = ("tokens", "kib", "push_blocks", "multicast")
+    keys = [k for k in all_results[0] if k not in meta]
     print("µs per call, max over ranks, bf16 [tokens, hidden] in CUDA graphs")
     print(
-        f"{'blocks':>6} {'tokens':>6} {'KiB':>6} " + " ".join(f"{k:>18}" for k in keys)
+        f"{'blocks':>6} {'mc':>2} {'tokens':>6} {'KiB':>6} "
+        + " ".join(f"{k:>18}" for k in keys)
     )
     for r in all_results:
         print(
-            f"{r['push_blocks']:>6} {r['tokens']:>6} {r['kib']:>6.0f} "
+            f"{r['push_blocks']:>6} {r['multicast']:>2} {r['tokens']:>6} "
+            f"{r['kib']:>6.0f} "
             + " ".join(f"{r.get(k, float('nan')):>18.2f}" for k in keys)
         )
     if args.json:

@@ -1106,7 +1106,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
   custom_ar.def("push_buffer_size(int world_size, int max_size) -> int");
   custom_ar.def(
       "register_push_buffers(int fa, int[] ipc_tensors, int max_size, "
-      "int blocks) -> ()");
+      "int blocks, int multicast_ptr) -> ()");
   custom_ar.def(
       "push_all_reduce_rmsnorm(int fa, Tensor! inp, Tensor! residual, "
       "Tensor gamma, Tensor! norm_out, Tensor! residual_out, "

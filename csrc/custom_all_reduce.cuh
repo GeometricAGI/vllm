@@ -118,12 +118,29 @@ constexpr int kPushRmsnormMaxThreads = 512;
 
 struct __align__(16) PushBuffers {
   uint4* ptrs[kMaxCustomCollectiveRanks];
+  // Multicast address of the same scratch (one store reaches every rank's
+  // copy through the NVSwitch), or nullptr. Only the fused sentinel kernels
+  // use it.
+  uint4* mc;
 };
 
 static DINLINE void st_volatile_v4(uint4* addr, uint4 v) {
   asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(addr),
                "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
                : "memory");
+}
+
+// Stores v at addr in every rank's scratch. The .f32 type only moves bits:
+// stores do not canonicalize, so 16-bit payloads and the sentinel survive.
+static DINLINE void multimem_st_v4(uint4* addr, uint4 v) {
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile(
+      "multimem.st.relaxed.sys.global.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(addr),
+      "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+      : "memory");
+  #else
+  __trap();
+  #endif
 }
 
 static DINLINE uint4 ld_volatile_v4(const uint4* addr) {
@@ -371,6 +388,12 @@ static DINLINE void push_rmsnorm_rows(Fetch fetch, const T* residual,
  * Rows and packs are split as in push_rmsnorm_rows, and each (row, pack)
  * belongs to the same thread when pushing, so a thread only overwrites input
  * or residual elements it has already read and pushed.
+ *
+ * With a multicast address (bufs.mc), each pack is pushed by one multimem
+ * store instead of ngpus - 1 unicast ones, so a rank sends its input once
+ * and the NVSwitch fans it out. That store also lands in our own slot, which
+ * the two-shot kernel polls, so we wait for it too before resetting it: a
+ * reset issued before the multicast copy arrived could be overwritten by it.
  */
 template <typename T, int ngpus, int kClusterSize>
 __global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
@@ -409,13 +432,18 @@ __global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
       const uint4 mine =
           push_sanitize(reinterpret_cast<const uint4*>(input)[idx]);
       const size_t dst = (parity * ngpus + rank) * region + idx;
+      if (bufs.mc != nullptr) {
+        multimem_st_v4(bufs.mc + dst, mine);
+      } else {
   #pragma unroll
-      for (int i = 1; i < ngpus; i++)
-        st_volatile_v4(bufs.ptrs[(rank + i) % ngpus] + dst, mine);
+        for (int i = 1; i < ngpus; i++)
+          st_volatile_v4(bufs.ptrs[(rank + i) % ngpus] + dst, mine);
+      }
     }
   }
 
   // Phase 2: per row, reduce, add the residual and normalize.
+  const bool poll_own = bufs.mc != nullptr;
   auto fetch = [&](size_t idx) {
     const uint4 own = push_sanitize(reinterpret_cast<const uint4*>(input)[idx]);
     // As in cross_device_reduce_push: our own slot is read and selected away
@@ -428,7 +456,7 @@ __global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
       for (int r = 0; r < ngpus; r++) {
         const uint4 v = ld_volatile_v4(self_buf + r * region + idx);
         const bool mine = r == rank;
-        ready &= mine || push_sentinel_ready(v);
+        ready &= (mine && !poll_own) || push_sentinel_ready(v);
         got[r] = push_select(mine, own, v);
       }
     } while (!ready);
@@ -436,7 +464,7 @@ __global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
         make_uint4(kPushSentinel, kPushSentinel, kPushSentinel, kPushSentinel);
   #pragma unroll
     for (int r = 0; r < ngpus; r++) {
-      if (r != rank) self_buf[r * region + idx] = s;
+      if (r != rank || poll_own) self_buf[r * region + idx] = s;
     }
     // Same rank order as cross_device_reduce_push, so every rank computes
     // bitwise identical rows.
@@ -474,7 +502,9 @@ __global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
  * by o arrives at rank r in slot [r2][idx] with r2 = the sender, so step 1
  * uses slots (src != r, idx owned by r) and step 3 slots (o, idx owned by o),
  * which never collide. Step 3 also resets the slot (r, idx) step 2 wrote
- * locally, which no other kernel writes.
+ * locally, which only the multicast one-shot also writes (and resets after
+ * polling it). With a multicast address, step 2 pushes each sum with one
+ * multimem store; step 1 stays unicast, as each pack has a single owner.
  *
  * Reuse is safe as for the one-shot: a launch only completes on a rank after
  * it received every row's sum, which needs every owner to have received that
@@ -551,9 +581,13 @@ __global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
     }
     P sum = downcast<P>(acc);
     const uint4 out = push_sanitize(*reinterpret_cast<uint4*>(&sum));
+    if (bufs.mc != nullptr) {
+      multimem_st_v4(bufs.mc + send_slot + idx, out);
+    } else {
   #pragma unroll
-    for (int i = 0; i < ngpus; i++)
-      st_volatile_v4(bufs.ptrs[(rank + i) % ngpus] + send_slot + idx, out);
+      for (int i = 0; i < ngpus; i++)
+        st_volatile_v4(bufs.ptrs[(rank + i) % ngpus] + send_slot + idx, out);
+    }
   }
 
   // Step 3: every row's sum, from its owner's slot.
@@ -844,11 +878,13 @@ class CustomAllreduce {
   /**
    * Register the IPC scratch buffers used by push_allreduce, one per rank,
    * each at least push_buffer_size(world_size, max_size) bytes and zeroed.
+   * mc is the multicast address of these buffers, or nullptr.
    * The caller must make sure that all ranks registered before any rank
    * calls push_allreduce.
    */
   void register_push_buffers(void** ptrs, size_t max_size,
-                             int blocks = kDefaultPushBlocks) {
+                             int blocks = kDefaultPushBlocks,
+                             void* mc = nullptr) {
     if (max_size % 16 != 0)
       throw std::runtime_error("push allreduce max size must be 16B aligned");
     if (blocks < 1 || blocks > kMaxPushBlocks)
@@ -861,6 +897,9 @@ class CustomAllreduce {
       push_ll_.ptrs[i] = reinterpret_cast<uint4*>(ptrs[i]);
       push_sentinel_.ptrs[i] = reinterpret_cast<uint4*>(ptrs[i]) + ll_units;
     }
+    push_ll_.mc = nullptr;
+    push_sentinel_.mc =
+        mc == nullptr ? nullptr : reinterpret_cast<uint4*>(mc) + ll_units;
     // The LL region is zeroed by the allocator, fill the sentinel region.
     size_t sentinel_words = 2 * world_size_ * max_packs * 4;
     if (cuMemsetD32(reinterpret_cast<CUdeviceptr>(push_sentinel_.ptrs[rank_]),
