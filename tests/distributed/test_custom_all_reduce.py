@@ -281,7 +281,7 @@ def push_allreduce_rmsnorm(
         ensure_model_parallel_initialized(tp_size, pp_size)
         group = get_tp_group().device_group
         fa = get_tp_group().device_communicator.ca_comm
-        assert fa is not None and fa.push_max_size == 1024 * 1024
+        assert fa is not None and fa.push_max_size == 2048 * 1024
         eps = 1e-5
 
         def make(rows, hidden, dtype, seed):
@@ -296,10 +296,14 @@ def push_allreduce_rmsnorm(
             gamma = torch.randn(hidden, dtype=dtype, device=device)
             return inp, residual, gamma
 
-        def check(inp, residual, gamma, norm_out, residual_out, weight_bias):
+        def check(inp, residual, gamma, norm_out, residual_out, weight_bias, two_shot):
             inputs = [torch.empty_like(inp) for _ in range(tp_size)]
             dist.all_gather(inputs, inp, group=group)
-            z = sum(x.float() for x in inputs) + residual.float()
+            reduced = sum(x.float() for x in inputs)
+            if two_shot:
+                # The owner rounds the sum before every rank adds the residual.
+                reduced = reduced.to(inp.dtype).float()
+            z = reduced + residual.float()
             # Exact: fp32 sum in rank order plus the residual, like the kernel.
             torch.testing.assert_close(residual_out, z.to(inp.dtype), atol=0, rtol=0)
             expected = z * torch.rsqrt(z.pow(2).mean(-1, keepdim=True) + eps)
@@ -311,9 +315,17 @@ def push_allreduce_rmsnorm(
             dist.all_gather(outputs, norm_out, group=group)
             assert all(torch.equal(outputs[0], o) for o in outputs)
 
-        # Interleave shapes, cluster sizes, in-place and out-of-place calls
-        # and the unfused push kernel, which shares the scratch and epochs.
-        shapes = [(1, 6144), (4, 6144), (37, 6144), (85, 6144), (3, 4096)]
+        # Interleave shapes, one- and two-shot kernels, cluster sizes, in-place
+        # and out-of-place calls and the unfused push kernel, which all share
+        # the scratch and epochs.
+        shapes = [
+            (1, 6144),
+            (4, 6144),
+            (37, 6144),
+            (85, 6144),
+            (170, 6144),
+            (3, 4096),
+        ]
         rng = random.Random(0)
         for seed, dtype in enumerate([torch.float16, torch.bfloat16] * 3):
             for rows, hidden in rng.sample(shapes, len(shapes)):
@@ -322,6 +334,7 @@ def push_allreduce_rmsnorm(
                 inp_ref, residual_ref = inp.clone(), residual.clone()
                 weight_bias = rng.choice([0.0, 1.0])
                 cluster_size = rng.choice([0, 1, 2, 4, 8])
+                two_shot = rng.random() < 0.5
                 if rng.random() < 0.5:
                     norm_out, residual_out = inp, residual
                 else:
@@ -336,26 +349,58 @@ def push_allreduce_rmsnorm(
                     residual_out,
                     eps,
                     weight_bias,
+                    two_shot,
                     cluster_size,
                 )
-                check(inp_ref, residual_ref, gamma, norm_out, residual_out, weight_bias)
+                check(
+                    inp_ref,
+                    residual_ref,
+                    gamma,
+                    norm_out,
+                    residual_out,
+                    weight_bias,
+                    two_shot,
+                )
                 out = tensor_model_parallel_all_reduce(inp_ref)
+                # Exact only through the push kernel; other backends may sum
+                # in another order.
+                pushed = fa.push_sync_mode(inp_ref) is not None
                 torch.testing.assert_close(
-                    out, sum_over_ranks(inp_ref, group, tp_size), atol=0, rtol=0
+                    out,
+                    sum_over_ranks(inp_ref, group, tp_size),
+                    atol=0 if pushed else 2e-2,
+                    rtol=0 if pushed else 2e-2,
                 )
 
-        inp, residual, gamma = make(4, 6144, torch.bfloat16, 0)
-        norm_out = torch.empty_like(inp)
+        # Graph replay of both kernels: 4 rows take the one-shot, 64 rows
+        # (768KiB) the two-shot one.
+        cases = []
+        for rows in (4, 64):
+            inp, residual, gamma = make(rows, 6144, torch.bfloat16, 0)
+            cases.append((inp, residual, gamma, torch.empty_like(inp)))
         with graph_capture(device=device) as graph_capture_context:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=graph_capture_context.stream):
-                fa.push_all_reduce_rmsnorm(inp, residual, gamma, norm_out, inp, eps)
+                for inp, residual, gamma, norm_out in cases:
+                    fa.push_all_reduce_rmsnorm(inp, residual, gamma, norm_out, inp, eps)
         for step in range(10):
-            new_inp, new_residual, _ = make(4, 6144, torch.bfloat16, step)
-            inp.copy_(new_inp)
-            residual.copy_(new_residual)
+            news = []
+            for inp, residual, _, _ in cases:
+                new_inp, new_residual, _ = make(inp.shape[0], 6144, inp.dtype, step)
+                inp.copy_(new_inp)
+                residual.copy_(new_residual)
+                news.append((new_inp, new_residual))
             graph.replay()
-            check(new_inp, new_residual, gamma, norm_out, inp, 0.0)
+            for (new_inp, new_residual), (inp, _, gamma, norm_out) in zip(news, cases):
+                check(
+                    new_inp,
+                    new_residual,
+                    gamma,
+                    norm_out,
+                    inp,
+                    0.0,
+                    two_shot=new_inp.nbytes >= 512 * 1024,
+                )
 
 
 def sum_over_ranks(inp, group, tp_size):
@@ -369,7 +414,7 @@ def test_push_allreduce_rmsnorm(monkeypatch: pytest.MonkeyPatch, tp_size):
     if torch.accelerator.device_count() < tp_size:
         pytest.skip("Not enough GPUs to run the test.")
     monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MODE", "sentinel")
-    monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB", "1024")
+    monkeypatch.setenv("VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB", "2048")
     multi_process_parallel(monkeypatch, tp_size, 1, push_allreduce_rmsnorm)
 
 

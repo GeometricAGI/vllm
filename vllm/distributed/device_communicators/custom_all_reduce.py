@@ -392,14 +392,22 @@ class CustomAllreduce:
         dist.barrier(group=self.group)
         self.push_max_size = max_size
 
-    def push_sync_mode(self, inp: torch.Tensor) -> Literal["ll", "sentinel"] | None:
-        """The sync mode of the push allreduce for inp, None if not used."""
+    def push_sync_mode(
+        self, inp: torch.Tensor, fused: bool = False
+    ) -> Literal["ll", "sentinel"] | None:
+        """The sync mode of the push allreduce for inp, None if not used.
+
+        fused asks for push_all_reduce_rmsnorm, which also has a two-shot
+        kernel; the unfused push_all_reduce is one-shot only, so it stops at
+        the two-shot threshold.
+        """
         inp_size = inp.numel() * inp.element_size()
-        if (
-            self.disabled
-            or inp_size > self.push_max_size
-            or not self.should_custom_ar(inp)
-        ):
+        max_size = self.push_max_size
+        if not fused:
+            max_size = min(
+                max_size, envs.VLLM_ALLREDUCE_PUSH_TWO_SHOT_MIN_KB * 1024 - 1
+            )
+        if self.disabled or inp_size > max_size or not self.should_custom_ar(inp):
             return None
         mode = envs.VLLM_ALLREDUCE_PUSH_MODE
         # Over PCIe, sentinel sync beat LL at every size down to 128B.
@@ -421,7 +429,7 @@ class CustomAllreduce:
         """Whether push_all_reduce_rmsnorm takes inp, a [..., hidden] input."""
         return (
             envs.VLLM_ALLREDUCE_PUSH_FUSE_RMSNORM
-            and self.push_sync_mode(inp) == "sentinel"
+            and self.push_sync_mode(inp, fused=True) == "sentinel"
             and inp.dtype in (torch.float16, torch.bfloat16)
             and gamma.dtype == inp.dtype
             and gamma.is_contiguous()
@@ -442,8 +450,10 @@ class CustomAllreduce:
         for inputs accepted by should_push_rmsnorm:
         residual_out = allreduce(inp) + residual and
         norm_out = rms_norm(residual_out) * (gamma + weight_bias).
-        norm_out and residual_out may alias inp and residual.
+        norm_out and residual_out may alias inp and residual. Messages from
+        VLLM_ALLREDUCE_PUSH_TWO_SHOT_MIN_KB up take the two-shot kernel.
         """
+        inp_size = inp.numel() * inp.element_size()
         ops.push_all_reduce_rmsnorm(
             self._ptr,
             inp,
@@ -453,6 +463,7 @@ class CustomAllreduce:
             residual_out,
             eps,
             weight_bias,
+            two_shot=inp_size >= envs.VLLM_ALLREDUCE_PUSH_TWO_SHOT_MIN_KB * 1024,
         )
 
     @contextmanager

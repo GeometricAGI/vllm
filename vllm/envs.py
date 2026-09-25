@@ -270,6 +270,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_PUSH_MAX_SIZE_KB: int = 256
     VLLM_ALLREDUCE_PUSH_BLOCKS: int = 36
     VLLM_ALLREDUCE_PUSH_FUSE_RMSNORM: bool = True
+    VLLM_ALLREDUCE_PUSH_TWO_SHOT_MIN_KB: int = 512
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1893,6 +1894,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it, instead of FlashInfer, for messages up to the push max size.
     "VLLM_ALLREDUCE_PUSH_FUSE_RMSNORM": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_PUSH_FUSE_RMSNORM", "1"))
+    ),
+    # Messages (KiB) from which the fused push allreduce + RMSNorm switches
+    # from the one-shot to the two-shot kernel. The unfused push allreduce is
+    # one-shot only, so it stops below this size.
+    "VLLM_ALLREDUCE_PUSH_TWO_SHOT_MIN_KB": lambda: int(
+        os.getenv("VLLM_ALLREDUCE_PUSH_TWO_SHOT_MIN_KB", "512")
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

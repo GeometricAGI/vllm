@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Allreduce + residual add + RMSNorm latency, captured in CUDA graphs.
 
-Compares the fused push kernel (per cluster size) with FlashInfer's fused
-allreduce (what the allreduce fusion pass uses by default), and with an
-unfused allreduce (push, custom 1-stage, NCCL) followed by vLLM's
-fused_add_rms_norm. Run one process per GPU:
+Compares the fused one-shot and two-shot push kernels (per cluster size)
+with FlashInfer's fused allreduce (what the allreduce fusion pass uses by
+default), and with an unfused allreduce (push, custom 1-stage, NCCL) followed
+by vLLM's fused_add_rms_norm. Run one process per GPU:
 
     python benchmarks/kernels/benchmark_push_allreduce_rmsnorm.py \
         --world-size 8 --hidden 6144 --push-blocks 36 64 128
@@ -62,8 +62,8 @@ def time_graph(fn, inner: int, reps: int, device) -> float:
     return statistics.median(samples)
 
 
-def check(ca, group, world_size, tokens, hidden, cluster, in_place, device):
-    """Compare the fused push kernel with an fp32 reference and across ranks."""
+def check(ca, group, world_size, tokens, hidden, cluster, in_place, two_shot, device):
+    """Compare a fused push kernel with an fp32 reference and across ranks."""
     dtype = torch.bfloat16
     torch.manual_seed(1000 * tokens + cluster + dist.get_rank())
     inp = torch.randn(tokens, hidden, dtype=dtype, device=device)
@@ -74,14 +74,27 @@ def check(ca, group, world_size, tokens, hidden, cluster, in_place, device):
     gamma = torch.randn(hidden, dtype=dtype, device=device)
     inputs = [torch.empty_like(inp) for _ in range(world_size)]
     dist.all_gather(inputs, inp, group=group)
-    z = sum(x.float() for x in inputs) + residual.float()
+    reduced = sum(x.float() for x in inputs)
+    if two_shot:
+        # The owner rounds the sum before every rank adds the residual.
+        reduced = reduced.to(dtype).float()
+    z = reduced + residual.float()
     expected = z * torch.rsqrt(z.pow(2).mean(-1, keepdim=True) + EPS) * gamma.float()
     if in_place:
         norm_out, residual_out = inp, residual
     else:
         norm_out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
     ops.push_all_reduce_rmsnorm(
-        ca._ptr, inp, residual, gamma, norm_out, residual_out, EPS, 0.0, cluster
+        ca._ptr,
+        inp,
+        residual,
+        gamma,
+        norm_out,
+        residual_out,
+        EPS,
+        0.0,
+        two_shot,
+        cluster,
     )
     torch.testing.assert_close(residual_out, z.to(dtype), atol=0, rtol=0)
     torch.testing.assert_close(norm_out, expected.to(dtype), atol=2e-2, rtol=2e-2)
@@ -131,17 +144,19 @@ def worker(rank: int, args, push_blocks: int, port: int, out_q) -> None:
                 if cluster and push_blocks % cluster:
                     continue
                 for in_place in (True, False):
-                    check(
-                        ca,
-                        tp.device_group,
-                        args.world_size,
-                        tokens,
-                        args.hidden,
-                        cluster,
-                        in_place,
-                        device,
-                    )
-                    n += 1
+                    for two_shot in (False, True):
+                        check(
+                            ca,
+                            tp.device_group,
+                            args.world_size,
+                            tokens,
+                            args.hidden,
+                            cluster,
+                            in_place,
+                            two_shot,
+                            device,
+                        )
+                        n += 1
         torch.accelerator.synchronize()
         if rank == 0:
             print(f"push_blocks={push_blocks}: {n} correctness checks passed")
@@ -175,17 +190,28 @@ def worker(rank: int, args, push_blocks: int, port: int, out_q) -> None:
                 flashinfer_fused, args.inner, args.reps, device
             )
 
-        for cluster in [0, 1, 2, 4, 8]:
-            if cluster and push_blocks % cluster:
-                continue
-            row[f"push_fused_c{cluster or 'auto'}"] = time_graph(
-                lambda: ops.push_all_reduce_rmsnorm(
-                    ca._ptr, inp, residual, gamma, inp, residual, EPS, 0.0, cluster
-                ),
-                args.inner,
-                args.reps,
-                device,
-            )
+        for two_shot in (False, True):
+            for cluster in [0, 1, 2, 4, 8]:
+                if cluster and push_blocks % cluster:
+                    continue
+                name = f"push_{'2shot' if two_shot else '1shot'}_c{cluster or 'auto'}"
+                row[name] = time_graph(
+                    lambda: ops.push_all_reduce_rmsnorm(
+                        ca._ptr,
+                        inp,
+                        residual,
+                        gamma,
+                        inp,
+                        residual,
+                        EPS,
+                        0.0,
+                        two_shot,
+                        cluster,
+                    ),
+                    args.inner,
+                    args.reps,
+                    device,
+                )
 
         def unfused(all_reduce):
             def fn():
@@ -231,10 +257,13 @@ def main() -> None:
     parser.add_argument("--world-size", type=int, default=8)
     parser.add_argument("--hidden", type=int, default=6144)
     parser.add_argument(
-        "--tokens", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 85]
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 16, 32, 48, 64, 85, 128, 170],
     )
     parser.add_argument("--push-blocks", type=int, nargs="+", default=[36])
-    parser.add_argument("--push-max-kb", type=int, default=1024)
+    parser.add_argument("--push-max-kb", type=int, default=2048)
     parser.add_argument("--fi-max-tokens", type=int, default=2048)
     parser.add_argument("--inner", type=int, default=50)
     parser.add_argument("--reps", type=int, default=30)

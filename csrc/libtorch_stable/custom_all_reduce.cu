@@ -192,15 +192,17 @@ void push_all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
  * Sentinel push allreduce of inp fused with a residual add and RMSNorm:
  * residual_out = allreduce(inp) + residual and norm_out = rmsnorm(
  * residual_out) * (gamma + weight_bias). norm_out and residual_out may alias
- * inp and residual. cluster_size is the number of blocks per row, 0 to pick
- * one.
+ * inp and residual. two_shot picks the two-shot (reduce-scatter +
+ * all-gather) kernel over the one-shot one. cluster_size is the number of
+ * blocks per row, 0 to pick one.
  */
 void push_all_reduce_rmsnorm(fptr_t _fa, torch::stable::Tensor& inp,
                              torch::stable::Tensor& residual,
                              torch::stable::Tensor& gamma,
                              torch::stable::Tensor& norm_out,
                              torch::stable::Tensor& residual_out, double eps,
-                             double weight_bias, int64_t cluster_size) {
+                             double weight_bias, bool two_shot,
+                             int64_t cluster_size) {
 #if !defined(USE_ROCM)
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   const torch::stable::accelerator::DeviceGuard device_guard(
@@ -228,7 +230,7 @@ void push_all_reduce_rmsnorm(fptr_t _fa, torch::stable::Tensor& inp,
         reinterpret_cast<T*>(norm_out.mutable_data_ptr()),                   \
         reinterpret_cast<T*>(residual_out.mutable_data_ptr()), rows,         \
         row_size, static_cast<float>(eps), static_cast<float>(weight_bias), \
-        cluster_size)
+        two_shot, cluster_size)
     case torch::headeronly::ScalarType::Half:
       PUSH_RMSNORM(half);
       break;

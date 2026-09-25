@@ -269,113 +269,43 @@ __global__ void __launch_bounds__(kPushThreads, 1)
 }
 
 /**
- * Sentinel push allreduce fused with a residual add and RMSNorm, the push
- * counterpart of FlashInfer's kARResidualRMSNorm allreduce fusion:
- *   residual_out = allreduce(input) + residual
- *   norm_out = residual_out * rsqrt(mean(residual_out^2) + eps)
- *              * (gamma + weight_bias)
- * with the sum, residual add and norm in fp32 and residual_out rounded only
- * when stored. norm_out and residual_out may alias input and residual.
+ * The fused tail of the push allreduce + residual add + RMSNorm kernels: for
+ * every row owned by this block's cluster, take each owned pack's reduced
+ * fp32 sum from fetch(idx), add the residual, store residual_out, and store
+ * norm_out = residual_out * rsqrt(mean(residual_out^2) + eps)
+ *            * (gamma + weight_bias).
  *
- * It shares the sentinel scratch and epochs of cross_device_reduce_push,
- * which is safe because both launch the same grid: every launch advances
- * every block's epoch by one, and a peer only rewrites a slot two launches
- * later, after this rank's whole grid of the launch in between has run.
- *
- * Each row (token) belongs to one cluster of kClusterSize blocks, each block
- * owning a contiguous slice of the row's 16B packs, and each (row, pack)
- * belongs to one thread both when pushing and when reducing. So a thread only
- * overwrites input or residual elements it has already read and pushed, and
+ * Each row belongs to one cluster of kClusterSize blocks, each block owning a
+ * contiguous slice of the row's 16B packs and each (row, pack) one thread, so
  * the only cross-block exchange is the row's sum of squares, through
- * distributed shared memory. The reduced fp32 row slice stays in dynamic
- * shared memory between the sum of squares and the normalization.
+ * distributed shared memory. The fp32 row slice stays in row_slice (dynamic
+ * shared memory, slice * elements per pack floats) between the sum of squares
+ * and the normalization.
  */
-template <typename T, int ngpus, int kClusterSize>
-__global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
-    cross_device_reduce_push_rmsnorm(
-        const __grid_constant__ PushBuffers bufs, Signal* self_sg,
-        const T* input, const T* residual,
-        const T* __restrict__ gamma, T* norm_out, T* residual_out, float eps,
-        float weight_bias, int rank, int rows, int row_packs, int max_packs) {
+template <typename T, int kClusterSize, typename Fetch>
+static DINLINE void push_rmsnorm_rows(Fetch fetch, const T* residual,
+                                      const T* __restrict__ gamma, T* norm_out,
+                                      T* residual_out, float eps,
+                                      float weight_bias, int rows,
+                                      int row_packs, float* row_slice) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
-  static_assert(sizeof(P) == sizeof(uint4));
   constexpr int kElems = P::size;
   namespace cg = cooperative_groups;
-
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  cudaGridDependencySynchronize();
-  cudaTriggerProgrammaticLaunchCompletion();
-  #endif
-  extern __shared__ float row_slice[];
   __shared__ float warp_sums[32];
   __shared__ float block_sum;
 
-  FlagType* epoch_ptr = &self_sg->push_epoch[true][blockIdx.x];
-  const uint32_t epoch = *epoch_ptr + 1;
-  const int parity = epoch & 1;
-  const size_t region = static_cast<size_t>(max_packs);
-  // bufs is a grid constant, so indexing it by rank reads param space
-  // directly instead of copying it to local memory first.
-  uint4* self_buf = bufs.ptrs[rank] + parity * ngpus * region;
-
   const int slice = (row_packs + kClusterSize - 1) / kClusterSize;
-  const int cluster_rank = blockIdx.x % kClusterSize;
-  const int first_pack = cluster_rank * slice;
+  const int first_pack = (blockIdx.x % kClusterSize) * slice;
   const int last_pack = min(row_packs, first_pack + slice);
-  const int first_row = blockIdx.x / kClusterSize;
   const int row_stride = gridDim.x / kClusterSize;
-
-  // Phase 1: push every owned pack of every owned row.
-  for (int row = first_row; row < rows; row += row_stride) {
-    for (int p = first_pack + threadIdx.x; p < last_pack; p += blockDim.x) {
-      const size_t idx = static_cast<size_t>(row) * row_packs + p;
-      const uint4 mine =
-          push_sanitize(reinterpret_cast<const uint4*>(input)[idx]);
-      const size_t dst = (parity * ngpus + rank) * region + idx;
-  #pragma unroll
-      for (int i = 1; i < ngpus; i++)
-        st_volatile_v4(bufs.ptrs[(rank + i) % ngpus] + dst, mine);
-    }
-  }
-
-  // Phase 2: per row, reduce, add the residual and normalize.
   cg::cluster_group cluster = cg::this_cluster();
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  for (int row = first_row; row < rows; row += row_stride) {
+  for (int row = blockIdx.x / kClusterSize; row < rows; row += row_stride) {
     float sum_sq = 0.f;
     for (int p = first_pack + threadIdx.x; p < last_pack; p += blockDim.x) {
       const size_t idx = static_cast<size_t>(row) * row_packs + p;
-      const uint4 own =
-          push_sanitize(reinterpret_cast<const uint4*>(input)[idx]);
-      // As in cross_device_reduce_push: our own slot is read and selected
-      // away so that got stays in registers.
-      uint4 got[ngpus];
-      bool ready;
-      do {
-        ready = true;
-  #pragma unroll
-        for (int r = 0; r < ngpus; r++) {
-          const uint4 v = ld_volatile_v4(self_buf + r * region + idx);
-          const bool mine = r == rank;
-          ready &= mine || push_sentinel_ready(v);
-          got[r] = push_select(mine, own, v);
-        }
-      } while (!ready);
-      const uint4 s = make_uint4(kPushSentinel, kPushSentinel, kPushSentinel,
-                                 kPushSentinel);
-  #pragma unroll
-      for (int r = 0; r < ngpus; r++) {
-        if (r != rank) self_buf[r * region + idx] = s;
-      }
-
-      // Same rank order as cross_device_reduce_push, so every rank computes
-      // bitwise identical rows.
-      A acc = upcast(*reinterpret_cast<P*>(&got[0]));
-  #pragma unroll
-      for (int r = 1; r < ngpus; r++) {
-        packed_assign_add(acc, upcast(*reinterpret_cast<P*>(&got[r])));
-      }
+      A acc = fetch(idx);
       packed_assign_add(acc,
                         upcast(reinterpret_cast<const P*>(residual)[idx]));
       reinterpret_cast<P*>(residual_out)[idx] = downcast<P>(acc);
@@ -422,6 +352,225 @@ __global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
     // a peer block still reads them.
     cluster.sync();
   }
+}
+
+/**
+ * One-shot sentinel push allreduce fused with a residual add and RMSNorm, the
+ * push counterpart of FlashInfer's kARResidualRMSNorm allreduce fusion:
+ *   residual_out = allreduce(input) + residual
+ *   norm_out = residual_out * rsqrt(mean(residual_out^2) + eps)
+ *              * (gamma + weight_bias)
+ * with the sum, residual add and norm in fp32 and residual_out rounded only
+ * when stored. norm_out and residual_out may alias input and residual.
+ *
+ * It shares the sentinel scratch and epochs of cross_device_reduce_push,
+ * which is safe because both launch the same grid: every launch advances
+ * every block's epoch by one, and a peer only rewrites a slot two launches
+ * later, after this rank's whole grid of the launch in between has run.
+ *
+ * Rows and packs are split as in push_rmsnorm_rows, and each (row, pack)
+ * belongs to the same thread when pushing, so a thread only overwrites input
+ * or residual elements it has already read and pushed.
+ */
+template <typename T, int ngpus, int kClusterSize>
+__global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
+    cross_device_reduce_push_rmsnorm(
+        const __grid_constant__ PushBuffers bufs, Signal* self_sg,
+        const T* input, const T* residual, const T* __restrict__ gamma,
+        T* norm_out, T* residual_out, float eps, float weight_bias, int rank,
+        int rows, int row_packs, int max_packs) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  static_assert(sizeof(P) == sizeof(uint4));
+
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+  #endif
+  extern __shared__ float row_slice[];
+
+  FlagType* epoch_ptr = &self_sg->push_epoch[true][blockIdx.x];
+  const uint32_t epoch = *epoch_ptr + 1;
+  const int parity = epoch & 1;
+  const size_t region = static_cast<size_t>(max_packs);
+  // bufs is a grid constant, so indexing it by rank reads param space
+  // directly instead of copying it to local memory first.
+  uint4* self_buf = bufs.ptrs[rank] + parity * ngpus * region;
+
+  const int slice = (row_packs + kClusterSize - 1) / kClusterSize;
+  const int first_pack = (blockIdx.x % kClusterSize) * slice;
+  const int last_pack = min(row_packs, first_pack + slice);
+  const int row_stride = gridDim.x / kClusterSize;
+
+  // Phase 1: push every owned pack of every owned row.
+  for (int row = blockIdx.x / kClusterSize; row < rows; row += row_stride) {
+    for (int p = first_pack + threadIdx.x; p < last_pack; p += blockDim.x) {
+      const size_t idx = static_cast<size_t>(row) * row_packs + p;
+      const uint4 mine =
+          push_sanitize(reinterpret_cast<const uint4*>(input)[idx]);
+      const size_t dst = (parity * ngpus + rank) * region + idx;
+  #pragma unroll
+      for (int i = 1; i < ngpus; i++)
+        st_volatile_v4(bufs.ptrs[(rank + i) % ngpus] + dst, mine);
+    }
+  }
+
+  // Phase 2: per row, reduce, add the residual and normalize.
+  auto fetch = [&](size_t idx) {
+    const uint4 own = push_sanitize(reinterpret_cast<const uint4*>(input)[idx]);
+    // As in cross_device_reduce_push: our own slot is read and selected away
+    // so that got stays in registers.
+    uint4 got[ngpus];
+    bool ready;
+    do {
+      ready = true;
+  #pragma unroll
+      for (int r = 0; r < ngpus; r++) {
+        const uint4 v = ld_volatile_v4(self_buf + r * region + idx);
+        const bool mine = r == rank;
+        ready &= mine || push_sentinel_ready(v);
+        got[r] = push_select(mine, own, v);
+      }
+    } while (!ready);
+    const uint4 s =
+        make_uint4(kPushSentinel, kPushSentinel, kPushSentinel, kPushSentinel);
+  #pragma unroll
+    for (int r = 0; r < ngpus; r++) {
+      if (r != rank) self_buf[r * region + idx] = s;
+    }
+    // Same rank order as cross_device_reduce_push, so every rank computes
+    // bitwise identical rows.
+    A acc = upcast(*reinterpret_cast<P*>(&got[0]));
+  #pragma unroll
+    for (int r = 1; r < ngpus; r++) {
+      packed_assign_add(acc, upcast(*reinterpret_cast<P*>(&got[r])));
+    }
+    return acc;
+  };
+  push_rmsnorm_rows<T, kClusterSize>(fetch, residual, gamma, norm_out,
+                                     residual_out, eps, weight_bias, rows,
+                                     row_packs, row_slice);
+
+  __syncthreads();
+  if (threadIdx.x == 0) *epoch_ptr = epoch;
+}
+
+/**
+ * Two-shot sentinel push allreduce fused with a residual add and RMSNorm,
+ * after the paper's LLBuffer two-shot: it sends 2 * (ngpus - 1) / ngpus times
+ * the input per rank instead of the one-shot's ngpus - 1, for the mid-size
+ * (~512KB-2MB) messages of large decode batches.
+ *
+ * Rows are split into ngpus contiguous shards, row r owned by rank
+ * r / ceil(rows / ngpus).
+ *   1. Reduce-scatter: every rank pushes each row to its owner's scratch.
+ *   2. Every owner polls its rows, reduces them in fp32 in rank order, and
+ *      pushes the sum, rounded to T, to every rank (and its own scratch).
+ *   3. Every rank polls every row's sum and runs push_rmsnorm_rows on it.
+ * The owner's rounded sum makes every rank's output bitwise identical; unlike
+ * the one-shot, the residual is added to that rounded sum.
+ *
+ * Scratch: the one-shot layout [parity][src][pack]. Pack idx of a row owned
+ * by o arrives at rank r in slot [r2][idx] with r2 = the sender, so step 1
+ * uses slots (src != r, idx owned by r) and step 3 slots (o, idx owned by o),
+ * which never collide. Step 3 also resets the slot (r, idx) step 2 wrote
+ * locally, which no other kernel writes.
+ *
+ * Reuse is safe as for the one-shot: a launch only completes on a rank after
+ * it received every row's sum, which needs every owner to have received that
+ * launch's rows from every rank, so a peer finishing launch e + 1 implies
+ * every rank finished launch e. Aliasing is safe because a row's sum only
+ * exists after every rank read and pushed that row's input.
+ */
+template <typename T, int ngpus, int kClusterSize>
+__global__ void __launch_bounds__(kPushRmsnormMaxThreads, 1)
+    cross_device_reduce_push_rmsnorm_2shot(
+        const __grid_constant__ PushBuffers bufs, Signal* self_sg,
+        const T* input, const T* residual, const T* __restrict__ gamma,
+        T* norm_out, T* residual_out, float eps, float weight_bias, int rank,
+        int rows, int row_packs, int max_packs) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  static_assert(sizeof(P) == sizeof(uint4));
+
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+  #endif
+  extern __shared__ float row_slice[];
+
+  FlagType* epoch_ptr = &self_sg->push_epoch[true][blockIdx.x];
+  const uint32_t epoch = *epoch_ptr + 1;
+  const int parity = epoch & 1;
+  const size_t region = static_cast<size_t>(max_packs);
+  uint4* self_buf = bufs.ptrs[rank] + parity * ngpus * region;
+  const size_t send_slot = (parity * ngpus + rank) * region;
+
+  const int rows_per_owner = (rows + ngpus - 1) / ngpus;
+  const size_t own_begin =
+      static_cast<size_t>(min(rows, rank * rows_per_owner)) * row_packs;
+  const size_t own_end =
+      static_cast<size_t>(min(rows, (rank + 1) * rows_per_owner)) * row_packs;
+  const size_t total = static_cast<size_t>(rows) * row_packs;
+  const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+
+  // Step 1: push every row we do not own to its owner.
+  for (size_t idx = tid; idx < total; idx += stride) {
+    const int owner = static_cast<int>(idx / row_packs) / rows_per_owner;
+    if (owner == rank) continue;
+    st_volatile_v4(bufs.ptrs[owner] + send_slot + idx,
+                   push_sanitize(reinterpret_cast<const uint4*>(input)[idx]));
+  }
+
+  // Step 2: reduce our rows and push their sums to every rank.
+  for (size_t idx = own_begin + tid; idx < own_end; idx += stride) {
+    const uint4 own = push_sanitize(reinterpret_cast<const uint4*>(input)[idx]);
+    uint4 got[ngpus];
+    bool ready;
+    do {
+      ready = true;
+  #pragma unroll
+      for (int r = 0; r < ngpus; r++) {
+        const uint4 v = ld_volatile_v4(self_buf + r * region + idx);
+        const bool mine = r == rank;
+        ready &= mine || push_sentinel_ready(v);
+        got[r] = push_select(mine, own, v);
+      }
+    } while (!ready);
+    const uint4 s =
+        make_uint4(kPushSentinel, kPushSentinel, kPushSentinel, kPushSentinel);
+  #pragma unroll
+    for (int r = 0; r < ngpus; r++) {
+      if (r != rank) self_buf[r * region + idx] = s;
+    }
+    A acc = upcast(*reinterpret_cast<P*>(&got[0]));
+  #pragma unroll
+    for (int r = 1; r < ngpus; r++) {
+      packed_assign_add(acc, upcast(*reinterpret_cast<P*>(&got[r])));
+    }
+    P sum = downcast<P>(acc);
+    const uint4 out = push_sanitize(*reinterpret_cast<uint4*>(&sum));
+  #pragma unroll
+    for (int i = 0; i < ngpus; i++)
+      st_volatile_v4(bufs.ptrs[(rank + i) % ngpus] + send_slot + idx, out);
+  }
+
+  // Step 3: every row's sum, from its owner's slot.
+  auto fetch = [&](size_t idx) {
+    const int owner = static_cast<int>(idx / row_packs) / rows_per_owner;
+    uint4* slot = self_buf + owner * region + idx;
+    uint4 v;
+    do {
+      v = ld_volatile_v4(slot);
+    } while (!push_sentinel_ready(v));
+    *slot =
+        make_uint4(kPushSentinel, kPushSentinel, kPushSentinel, kPushSentinel);
+    return upcast(*reinterpret_cast<P*>(&v));
+  };
+  push_rmsnorm_rows<T, kClusterSize>(fetch, residual, gamma, norm_out,
+                                     residual_out, eps, weight_bias, rows,
+                                     row_packs, row_slice);
 
   __syncthreads();
   if (threadIdx.x == 0) *epoch_ptr = epoch;
@@ -783,15 +932,16 @@ class CustomAllreduce {
 
   /**
    * Sentinel push allreduce fused with a residual add and RMSNorm, see
-   * cross_device_reduce_push_rmsnorm. input and residual are [rows,
-   * row_size]; norm_out and residual_out may alias them. cluster_size is
-   * the number of blocks per row, 0 to pick one.
+   * cross_device_reduce_push_rmsnorm (one-shot) and
+   * cross_device_reduce_push_rmsnorm_2shot (two_shot). input and residual
+   * are [rows, row_size]; norm_out and residual_out may alias them.
+   * cluster_size is the number of blocks per row, 0 to pick one.
    */
   template <typename T>
   void push_allreduce_rmsnorm(cudaStream_t stream, const T* input,
                               const T* residual, const T* gamma, T* norm_out,
                               T* residual_out, int rows, int row_size,
-                              float eps, float weight_bias,
+                              float eps, float weight_bias, bool two_shot,
                               int cluster_size = 0) {
     constexpr int d = packed_t<T>::P::size;
     if (row_size % d != 0)
@@ -830,7 +980,9 @@ class CustomAllreduce {
                               .numAttrs = 2};
   #define KL(ngpus, cs)                                                     \
     {                                                                       \
-      auto kernel = &cross_device_reduce_push_rmsnorm<T, ngpus, cs>;        \
+      auto kernel = two_shot                                                \
+                        ? &cross_device_reduce_push_rmsnorm_2shot<T, ngpus, cs> \
+                        : &cross_device_reduce_push_rmsnorm<T, ngpus, cs>;      \
       if (smem > 48 * 1024)                                                 \
         CUDACHECK(cudaFuncSetAttribute(                                     \
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));    \

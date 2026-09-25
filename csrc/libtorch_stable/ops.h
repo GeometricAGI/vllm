@@ -533,7 +533,8 @@ void push_all_reduce_rmsnorm(fptr_t _fa, torch::stable::Tensor& inp,
                              torch::stable::Tensor& gamma,
                              torch::stable::Tensor& norm_out,
                              torch::stable::Tensor& residual_out, double eps,
-                             double weight_bias, int64_t cluster_size);
+                             double weight_bias, bool two_shot,
+                             int64_t cluster_size);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);

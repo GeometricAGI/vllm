@@ -3204,6 +3204,7 @@ def push_all_reduce_rmsnorm(
     residual_out: torch.Tensor,
     eps: float,
     weight_bias: float = 0.0,
+    two_shot: bool = False,
     cluster_size: int = 0,
 ) -> None:
     torch.ops._C_custom_ar.push_all_reduce_rmsnorm(
@@ -3215,6 +3216,7 @@ def push_all_reduce_rmsnorm(
         residual_out,
         eps,
         weight_bias,
+        two_shot,
         cluster_size,
     )
 

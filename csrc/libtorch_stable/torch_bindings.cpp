@@ -1110,7 +1110,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
   custom_ar.def(
       "push_all_reduce_rmsnorm(int fa, Tensor! inp, Tensor! residual, "
       "Tensor gamma, Tensor! norm_out, Tensor! residual_out, "
-      "float eps, float weight_bias, int cluster_size) -> ()");
+      "float eps, float weight_bias, bool two_shot, int cluster_size) -> ()");
   custom_ar.def("dispose(int fa) -> ()");
   custom_ar.def("meta_size() -> int");
   custom_ar.def("register_buffer(int fa, int[] ipc_tensors) -> ()");
