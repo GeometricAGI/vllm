@@ -62,6 +62,44 @@ def time_graph(fn, inner: int, reps: int, device) -> float:
     return statistics.median(samples)
 
 
+def check(ca, group, world_size, tokens, hidden, cluster, in_place, device):
+    """Compare the fused push kernel with an fp32 reference and across ranks."""
+    dtype = torch.bfloat16
+    torch.manual_seed(1000 * tokens + cluster + dist.get_rank())
+    inp = torch.randn(tokens, hidden, dtype=dtype, device=device)
+    inp[0, :32] = 0.0
+    inp[0, 1:32:2] = -0.0  # packed +0/-0 words collide with the sentinel
+    torch.manual_seed(tokens)  # residual and gamma match on all ranks
+    residual = torch.randn_like(inp)
+    gamma = torch.randn(hidden, dtype=dtype, device=device)
+    inputs = [torch.empty_like(inp) for _ in range(world_size)]
+    dist.all_gather(inputs, inp, group=group)
+    z = sum(x.float() for x in inputs) + residual.float()
+    expected = z * torch.rsqrt(z.pow(2).mean(-1, keepdim=True) + EPS) * gamma.float()
+    if in_place:
+        norm_out, residual_out = inp, residual
+    else:
+        norm_out, residual_out = torch.empty_like(inp), torch.empty_like(inp)
+    ops.push_all_reduce_rmsnorm(
+        ca._ptr, inp, residual, gamma, norm_out, residual_out, EPS, 0.0, cluster
+    )
+    torch.testing.assert_close(residual_out, z.to(dtype), atol=0, rtol=0)
+    torch.testing.assert_close(norm_out, expected.to(dtype), atol=2e-2, rtol=2e-2)
+    outs = [torch.empty_like(norm_out) for _ in range(world_size)]
+    dist.all_gather(outs, norm_out, group=group)
+    assert all(torch.equal(outs[0], o) for o in outs), "ranks disagree"
+    # The unfused push kernel shares the scratch and epochs: interleave it.
+    x = torch.randn(tokens, hidden, dtype=dtype, device=device)
+    xs = [torch.empty_like(x) for _ in range(world_size)]
+    dist.all_gather(xs, x, group=group)
+    torch.testing.assert_close(
+        ca.push_all_reduce(x, "sentinel"),
+        sum(v.float() for v in xs).to(dtype),
+        atol=0,
+        rtol=0,
+    )
+
+
 def worker(rank: int, args, push_blocks: int, port: int, out_q) -> None:
     os.environ.update(
         VLLM_ALLREDUCE_PUSH_MODE="sentinel",
@@ -83,6 +121,30 @@ def worker(rank: int, args, push_blocks: int, port: int, out_q) -> None:
     assert ca is not None and ca.push_max_size > 0, "push allreduce not enabled"
 
     from vllm.compilation.passes.fusion import allreduce_rms_fusion as arf
+
+    if args.check:
+        n = 0
+        for tokens in args.tokens:
+            if tokens * args.hidden * 2 > ca.push_max_size:
+                continue
+            for cluster in [0, 1, 2, 4, 8]:
+                if cluster and push_blocks % cluster:
+                    continue
+                for in_place in (True, False):
+                    check(
+                        ca,
+                        tp.device_group,
+                        args.world_size,
+                        tokens,
+                        args.hidden,
+                        cluster,
+                        in_place,
+                        device,
+                    )
+                    n += 1
+        torch.accelerator.synchronize()
+        if rank == 0:
+            print(f"push_blocks={push_blocks}: {n} correctness checks passed")
 
     dtype = torch.bfloat16
     gamma = torch.randn(args.hidden, dtype=dtype, device=device)
@@ -177,6 +239,9 @@ def main() -> None:
     parser.add_argument("--inner", type=int, default=50)
     parser.add_argument("--reps", type=int, default=30)
     parser.add_argument("--json", help="also write results to this file")
+    parser.add_argument(
+        "--check", action="store_true", help="check correctness before timing"
+    )
     args = parser.parse_args()
 
     ctx = mp.get_context("spawn")
