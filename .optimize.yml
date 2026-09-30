@@ -1,0 +1,4 @@
+enabled: true
+events: [issues]
+approvers: [pramodith]
+base: main
