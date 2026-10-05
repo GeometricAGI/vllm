@@ -1,0 +1,90 @@
+name: Optimize a model
+description: Optimize a model end to end on one engine and GPU, optionally shrinking it first.
+title: "Optimize model: "
+labels: ["optimization"]
+body:
+  - type: input
+    attributes:
+      label: Model
+      description: The model to optimize.
+      placeholder: meta-llama/Llama-3.1-8B
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Engine
+      description: The inference engine to optimize for.
+      options:
+        - vllm
+        - lucebox
+        - whittle
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Hardware
+      description: The GPU to optimize for.
+      options:
+        - B200
+        - H100
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Metrics
+      description: What to optimize, one per line. Leave empty for the defaults.
+      placeholder: |
+        throughput
+        p99 latency
+  - type: dropdown
+    attributes:
+      label: Tune only
+      description: Only tune the engine's settings, skipping profiling and kernel work. Cannot be combined with shrinking.
+      options:
+        - "No"
+        - "Yes"
+      default: 0
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Shrink the model first
+      description: Quantize and prune the model before optimizing it. The next four questions apply only if this is Yes.
+      options:
+        - "No"
+        - "Yes"
+      default: 0
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Target size
+      description: The size to shrink the model to. Required if shrinking.
+      placeholder: 40GB
+  - type: dropdown
+    attributes:
+      label: Quantize
+      description: Whether shrinking quantizes the model. Leave unset for the default, Yes.
+      options:
+        - "Yes"
+        - "No"
+  - type: dropdown
+    attributes:
+      label: Prune
+      description: Whether shrinking prunes the model. Leave unset for the default, Yes.
+      options:
+        - "Yes"
+        - "No"
+  - type: textarea
+    attributes:
+      label: Quantization formats
+      description: Formats to quantize to, one per line. Leave empty to let the planner choose.
+      placeholder: |
+        fp8
+        nvfp4
+  - type: checkboxes
+    attributes:
+      label: Start
+      options:
+        - label: Start the optimization now by tagging @geometricAGI
+          required: true
