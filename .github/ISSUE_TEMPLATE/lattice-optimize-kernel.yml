@@ -1,0 +1,39 @@
+name: Optimize a kernel
+description: Make one kernel faster on one GPU and prove it still computes the same thing.
+title: "Optimize kernel: "
+labels: ["optimization"]
+body:
+  - type: input
+    attributes:
+      label: Kernel
+      description: The kernel to optimize, such as a file path or a function name in the repository.
+      placeholder: kernels/attn_fwd.cu
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Hardware
+      description: The GPU to optimize for.
+      options:
+        - B200
+        - H100
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Shapes
+      description: Input shapes to optimize for, one per line. Leave empty to let the planner choose.
+      placeholder: |
+        1x8x4096
+        8x8x4096
+  - type: input
+    attributes:
+      label: Minimum speedup
+      description: The speedup that counts as a success, as a number greater than 1.
+      placeholder: "1.5"
+  - type: checkboxes
+    attributes:
+      label: Start
+      options:
+        - label: Start the optimization now by tagging @geometricAGI
+          required: true
