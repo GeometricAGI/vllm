@@ -1,0 +1,91 @@
+name: Optimize an endpoint
+description: Mine a live endpoint's traffic, tune for each pattern, and simulate the full workload.
+title: "Optimize endpoint: "
+labels: ["optimization"]
+body:
+  - type: input
+    attributes:
+      label: Traffic
+      description: Where the endpoint's traffic is recorded.
+      placeholder: stats-api
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Deploy repository
+      description: The repository that deploys the endpoint.
+      placeholder: my-org/infra
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Nodes
+      description: How many nodes the endpoint runs on, as a whole number.
+      placeholder: "8"
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Model
+      description: The model the endpoint serves.
+      placeholder: meta-llama/Llama-3.1-8B
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Hardware
+      description: The GPU the endpoint runs on.
+      options:
+        - B200
+        - H100
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Metrics
+      description: What to optimize, one per line. Leave empty for the defaults.
+      placeholder: |
+        throughput
+        p99 latency
+  - type: dropdown
+    attributes:
+      label: Shrink the model first
+      description: Quantize and prune the model before optimizing it. The next four questions apply only if this is Yes.
+      options:
+        - "No"
+        - "Yes"
+      default: 0
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Target size
+      description: The size to shrink the model to. Required if shrinking.
+      placeholder: 40GB
+  - type: dropdown
+    attributes:
+      label: Quantize
+      description: Whether shrinking quantizes the model. Leave unset for the default, Yes.
+      options:
+        - "Yes"
+        - "No"
+  - type: dropdown
+    attributes:
+      label: Prune
+      description: Whether shrinking prunes the model. Leave unset for the default, Yes.
+      options:
+        - "Yes"
+        - "No"
+  - type: textarea
+    attributes:
+      label: Quantization formats
+      description: Formats to quantize to, one per line. Leave empty to let the planner choose.
+      placeholder: |
+        fp8
+        nvfp4
+  - type: checkboxes
+    attributes:
+      label: Start
+      options:
+        - label: Start the optimization now by tagging @geometricAGI
+          required: true
