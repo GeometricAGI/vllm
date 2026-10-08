@@ -132,6 +132,26 @@ async def test_load(
         )
         after.callback(engine.shutdown)
 
+        # The first request an engine serves pays a few hundred milliseconds of
+        # one-off setup, and while it does the engine holds the requests already
+        # routed to it while reporting itself idle, which is enough to skew the
+        # split asserted on below. Pay it on every engine first, then measure.
+        await asyncio.gather(
+            *(
+                generate(
+                    engine,
+                    f"warmup-{rank}",
+                    prompt,
+                    output_kind,
+                    max_tokens=1,
+                    data_parallel_rank=rank,
+                )
+                for rank in range(DP_SIZE)
+            )
+        )
+        for sl in stats_loggers.values():
+            sl.finished_req_count = 0
+
         NUM_REQUESTS = 100
         NUM_EXPECTED_TOKENS = 10
 
@@ -699,7 +719,7 @@ async def test_dp_pause_barrier_request_deadlock():
         # Drive the staggered barrier.  Old code deadlocks here.
         try:
             await asyncio.wait_for(client.call_utility_async("barrier"), timeout=30)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             for t in mid_barrier_tasks:
                 t.cancel()
             pytest.fail(
