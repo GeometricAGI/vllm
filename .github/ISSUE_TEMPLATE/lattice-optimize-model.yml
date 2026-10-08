@@ -10,6 +10,10 @@ body:
       placeholder: meta-llama/Llama-3.1-8B
     validations:
       required: true
+  - type: input
+    attributes:
+      label: Model revision
+      description: The model's Hugging Face commit, branch or tag. Leave empty for main.
   - type: dropdown
     attributes:
       label: Engine
@@ -32,10 +36,38 @@ body:
   - type: textarea
     attributes:
       label: Metrics
-      description: What to optimize, one per line. Leave empty for the defaults.
+      description: What to optimize, one per line. Leave empty for the defaults (output tokens per second).
       placeholder: |
         throughput
-        p99 latency
+  - type: input
+    attributes:
+      label: Prompts
+      description: How many prompts each measurement sends. Leave empty for the default.
+      placeholder: "64"
+  - type: input
+    attributes:
+      label: Input tokens per prompt
+      description: Leave empty for the default.
+      placeholder: "1024"
+  - type: input
+    attributes:
+      label: Output tokens per prompt
+      description: Leave empty for the default.
+      placeholder: "128"
+  - type: textarea
+    attributes:
+      label: Engine arguments
+      description: The engine settings to optimize under, one name=value per line. Leave empty for the engine's defaults.
+      placeholder: |
+        max_num_seqs=128
+  - type: input
+    attributes:
+      label: Minimum speedup
+      description: The end-to-end speedup a result must reach, such as 1.05. Leave empty for the default.
+  - type: textarea
+    attributes:
+      label: Hints
+      description: Anything the planner should know, such as where to look or what to leave alone.
   - type: dropdown
     attributes:
       label: Tune only
