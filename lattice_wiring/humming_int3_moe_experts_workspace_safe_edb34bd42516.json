@@ -1,0 +1,7 @@
+{
+  "id": "humming-int3-moe-experts-workspace-safe",
+  "key": "humming_int3_moe_experts_workspace_safe_edb34bd42516",
+  "kernel": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe_tkdsl.py",
+  "task_file": "humming_int3_moe_experts_workspace_safe_edb34bd42516.py",
+  "kind": "module"
+}
