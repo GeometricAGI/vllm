@@ -83,6 +83,13 @@ class InputProcessor:
             self.process_inputs, executor=self.renderer._executor
         )
 
+        # Per-request invariants, resolved lazily once. The tokenizer's EOS id
+        # and its token-id upper bound never change after start-up, and reading
+        # them from a HF tokenizer goes through slow ``__getattr__`` lookups.
+        self._eos_token_id_cached = False
+        self._eos_token_id: int | None = None
+        self._max_valid_token_id: int | None = None
+
     @property
     def tokenizer(self) -> TokenizerLike | None:
         return self.renderer.tokenizer
@@ -488,7 +495,7 @@ class InputProcessor:
 
             sampling_params.update_from_generation_config(
                 self.generation_config_fields,
-                self.renderer.get_eos_token_id(),
+                self._get_eos_token_id(),
             )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
@@ -553,6 +560,37 @@ class InputProcessor:
             session_id=session_id,
             kv_hints=kv_hints,
         )
+
+    def _get_eos_token_id(self) -> int | None:
+        if self._eos_token_id_cached:
+            return self._eos_token_id
+        eos_token_id = self.renderer.get_eos_token_id()
+        if self.tokenizer is not None:
+            self._eos_token_id = eos_token_id
+            self._eos_token_id_cached = True
+        return eos_token_id
+
+    def _validate_token_ids(self, token_ids) -> None:
+        """Same checks as ``renderer.validate_token_ids`` with the bound cached."""
+        limit = self._max_valid_token_id
+        if limit is None:
+            tokenizer = self.tokenizer
+            if tokenizer is None:
+                return
+            limit = max(
+                tokenizer.max_token_id, self.model_config.get_vocab_size() - 1
+            )
+            self._max_valid_token_id = limit
+        max_input_id = max(token_ids)
+        min_input_id = min(token_ids)
+        if min_input_id < 0:
+            raise VLLMValidationError(
+                f"Token id {min_input_id} is out of vocabulary", parameter=None
+            )
+        if max_input_id > limit:
+            raise VLLMValidationError(
+                f"Token id {max_input_id} is out of vocabulary", parameter=None
+            )
 
     def _validate_prompt_len(
         self,
@@ -644,7 +682,7 @@ class InputProcessor:
 
         # Shared by generate, embedding and pooling requests.
         if prompt_ids:
-            self.renderer.validate_token_ids(prompt_ids)
+            self._validate_token_ids(prompt_ids)
 
     def _validate_model_inputs(
         self,
