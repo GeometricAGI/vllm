@@ -40,57 +40,61 @@ def maybe_make_thread_pool(tokenizer: _T, copies: int = 1):
 
     og_tokenizer = copy.copy(tokenizer)
 
-    tokenizer_pool: queue.Queue[TokenizersBackend] = queue.Queue()
-    for _ in range(copies):
+    # SimpleQueue is a C-implemented, lock-light FIFO. The pool is built once,
+    # up front; the request path never deep-copies a tokenizer: if every copy
+    # is busy it blocks until one is returned.
+    tokenizer_pool: queue.SimpleQueue[TokenizersBackend] = queue.SimpleQueue()
+    for _ in range(max(copies, 1)):
         tokenizer_pool.put(copy.deepcopy(og_tokenizer))
 
-    @contextlib.contextmanager
-    def _borrow_from_pool():
+    _get_nowait = tokenizer_pool.get_nowait
+    _get = tokenizer_pool.get
+    _put = tokenizer_pool.put
+
+    def _call(name, args, kwargs):
         try:
-            tok = tokenizer_pool.get_nowait()
-            yield tok
+            tok = _get_nowait()
         except queue.Empty:
-            tok = copy.deepcopy(og_tokenizer)
-            yield tok
+            tok = _get()
+        try:
+            return getattr(tok, name)(*args, **kwargs)
         finally:
-            tokenizer_pool.put(tok)
+            _put(tok)
 
     class TokenizerPool(tokenizer.__class__, ThreadSafeHFTokenizerMixin):  # type: ignore
         def apply_chat_template(self, *args, **kwargs):
-            with _borrow_from_pool() as tok:
-                return tok.apply_chat_template(*args, **kwargs)
+            return _call("apply_chat_template", args, kwargs)
 
         def batch_decode(self, *args, **kwargs):
-            with _borrow_from_pool() as tok:
-                return tok.batch_decode(*args, **kwargs)
+            return _call("batch_decode", args, kwargs)
 
         def batch_encode(self, *args, **kwargs):
-            with _borrow_from_pool() as tok:
-                return tok.batch_encode(*args, **kwargs)
+            return _call("batch_encode", args, kwargs)
 
         def convert_tokens_to_ids(self, *args, **kwargs):
-            with _borrow_from_pool() as tok:
-                return tok.convert_tokens_to_ids(*args, **kwargs)
+            return _call("convert_tokens_to_ids", args, kwargs)
 
         def convert_ids_to_tokens(self, *args, **kwargs):
-            with _borrow_from_pool() as tok:
-                return tok.convert_ids_to_tokens(*args, **kwargs)
+            return _call("convert_ids_to_tokens", args, kwargs)
 
         def convert_tokens_to_string(self, *args, **kwargs):
-            with _borrow_from_pool() as tok:
-                return tok.convert_tokens_to_string(*args, **kwargs)
+            return _call("convert_tokens_to_string", args, kwargs)
 
         def decode(self, *args, **kwargs):
-            with _borrow_from_pool() as tok:
-                return tok.decode(*args, **kwargs)
+            return _call("decode", args, kwargs)
 
         def encode(self, *args, **kwargs):
-            with _borrow_from_pool() as tok:
-                return tok.encode(*args, **kwargs)
+            return _call("encode", args, kwargs)
 
         def __call__(self, *args, **kwargs):
-            with _borrow_from_pool() as tok:
+            try:
+                tok = _get_nowait()
+            except queue.Empty:
+                tok = _get()
+            try:
                 return tok(*args, **kwargs)
+            finally:
+                _put(tok)
 
         def __reduce__(self):
             return maybe_make_thread_pool, (og_tokenizer, copies)
