@@ -68,7 +68,7 @@ body:
   - type: dropdown
     attributes:
       label: Shrink the model first
-      description: Quantize and prune the model before optimizing it. The next four questions apply only if this is Yes.
+      description: Quantize and prune the model before optimizing it. The next five questions apply only if this is Yes.
       options:
         - "No"
         - "Yes"
@@ -101,6 +101,11 @@ body:
       placeholder: |
         fp8
         nvfp4
+  - type: input
+    attributes:
+      label: Quantization budget (GPU-hours)
+      description: The most GPU time quantization may use, in GPU-hours. Applies only if shrinking quantizes. Leave empty for the recommended 8.
+      placeholder: "8"
   - type: input
     attributes:
       label: Planner model
