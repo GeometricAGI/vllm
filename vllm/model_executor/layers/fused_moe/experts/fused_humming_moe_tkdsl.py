@@ -1800,5 +1800,3 @@ def _original_apply(self, output, hidden_states, w1, w2, topk_weights, topk_ids,
         valid_tokens = expert_tokens_meta.psum_recv_per_rank[-1:]
     moe_fused_mul_sum(inputs=buffers["down_output"].view(*topk_ids.shape, -1), topk_weights=topk_weights,
                       topk_ids=topk_ids, expert_map=expert_map, outputs=output, num_valid_tokens=valid_tokens)
-
-
