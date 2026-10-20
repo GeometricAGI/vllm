@@ -3,5 +3,6 @@
   "key": "int3_humming_moe_9641f91d5028",
   "kernel": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe_tkdsl.py",
   "task_file": "int3_humming_moe_9641f91d5028.py",
-  "kind": "module"
+  "kind": "module",
+  "gpu": "B300"
 }
