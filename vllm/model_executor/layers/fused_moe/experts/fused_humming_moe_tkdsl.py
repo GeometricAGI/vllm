@@ -3,7 +3,7 @@
 Decode path (m <= 64): device routing -> INT3 gate/up grouped GEMV with fused clamped SwiGLU -> INT3 down grouped GEMV
 (top-k weight applied) -> top-k sum.  Weights are streamed through shared memory with bulk async copies, decoded in
 registers (codes used in place as bf16 magic numbers, k8-15 activations prescaled by 1/16) and multiplied with
-mma.sync m16n8k16.  Larger m runs the engine's own Humming helpers.
+mma.sync m16n8k16.  Steps of 65 to PREFILL_MIN - 1 tokens run Humming; larger ones the prefill kernels.
 """
 
 import torch
@@ -18,6 +18,10 @@ K2, N2 = 2304, 5120
 TOPK = 6
 CAP = 64          # max picks per expert on the decode path (m <= 64, ids distinct per token)
 DECODE_MAX = 64
+# The prefill kernels lose to Humming below this many tokens on a B300 (0.62x for 65-2048, 0.98x at 8192, 0.99x at
+# 8283) and win above it (1.10x at 9216, 1.22x at 16384), so steps of 65 to 8447 tokens run Humming. Spec-decode
+# verification steps (4 tokens per request with 3 drafts) and 4096-token prefill chunks fall in that range.
+PREFILL_MIN = 8448
 
 WPR1 = N1 * 3 // 2               # u32 words per 16-K row of w13
 W1E = (K1 // 16) * WPR1          # words per expert of w13
@@ -1750,7 +1754,7 @@ def apply(
         return
     cfg = self.activation_config
     limit = cfg.clamp_limit if cfg is not None else None
-    if (m > DECODE_MAX and expert_tokens_meta is None and expert_map is None and a1q_scale is None
+    if (m >= PREFILL_MIN and expert_tokens_meta is None and expert_map is None and a1q_scale is None
             and not apply_router_weight_on_input and activation == _MoEActivation.SILU and limit is not None
             and topk_ids.size(1) == TOPK and w1.size(0) == E):
         x = hidden_states.view(-1, hidden_states.size(-1))
@@ -1778,7 +1782,7 @@ def apply(
 def _original_apply(self, output, hidden_states, w1, w2, topk_weights, topk_ids, activation,
                     global_num_experts, expert_map, a1q_scale, a2_scale, workspace13, workspace2,
                     expert_tokens_meta, apply_router_weight_on_input):
-    """The engine's own Humming path, kept for token counts the TKDSL kernels do not cover yet."""
+    """The engine's own Humming path, for token counts where it beats the TKDSL kernels or they do not cover."""
     hidden_states = hidden_states.view(-1, hidden_states.size(-1))
     buffers = self.prepare_buffers(workspace13, workspace2, topk_ids.size(0), topk_ids.size(1), activation)
     buffers["output"] = output
