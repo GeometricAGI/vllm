@@ -1,0 +1,8 @@
+{
+  "id": "int3-moe-v3",
+  "key": "int3_moe_v3_c3b3cceeddfc",
+  "kernel": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe_tkdsl_v3.py",
+  "task_file": "int3_moe_v3_c3b3cceeddfc.py",
+  "kind": "module",
+  "gpu": "B300"
+}
