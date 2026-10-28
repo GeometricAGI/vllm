@@ -153,6 +153,19 @@ def _natural_sort_key(filepath: str) -> list:
     ]
 
 
+def _safetensors_keys_in_file_order(st_file: str) -> list[str]:
+    """Tensor names in the order of their data in the file.
+
+    ``safe_open().keys()`` is sorted by name, which reads a memory-mapped file
+    at random offsets; data order lets the kernel read ahead sequentially.
+    """
+    with open(st_file, "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    return sorted(header, key=lambda name: header[name]["data_offsets"][0])
+
+
 def maybe_download_from_modelscope(
     model: str,
     revision: str | None = None,
@@ -1206,7 +1219,7 @@ def safetensors_weights_iterator(
             yield from unflattened_state_dict.items()
         else:
             with safe_open(st_file, framework="pt") as f:
-                for name in f.keys():  # noqa: SIM118
+                for name in _safetensors_keys_in_file_order(st_file):
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)

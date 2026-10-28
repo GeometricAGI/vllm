@@ -309,3 +309,32 @@ def test_drop_checkpoint_cache_releases_local_weight_files(
 
 if __name__ == "__main__":
     test_download_weights_from_hf()
+
+
+def test_safetensors_weights_iterator_yields_tensors_in_file_order(tmp_path):
+    """Reading a memory-mapped shard in data order keeps its reads sequential;
+    safetensors stores wider dtypes first, so data order differs from names."""
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from vllm.model_executor.model_loader.weight_utils import (
+        safetensors_weights_iterator,
+    )
+
+    tensors = {
+        "a.weight": torch.arange(4, dtype=torch.float16),
+        "b.weight": torch.arange(4, dtype=torch.float32),
+        "c.weight": torch.arange(4, dtype=torch.float16) + 4,
+    }
+    path = str(tmp_path / "model.safetensors")
+    save_file(tensors, path)
+    with safe_open(path, framework="pt") as f:
+        name_order = list(f.keys())
+
+    loaded = list(safetensors_weights_iterator([path], use_tqdm_on_load=False))
+
+    assert [name for name, _ in loaded] == ["b.weight", "a.weight", "c.weight"]
+    assert [name for name, _ in loaded] != name_order
+    for name, tensor in loaded:
+        torch.testing.assert_close(tensor, tensors[name])
