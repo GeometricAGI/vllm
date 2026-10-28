@@ -339,6 +339,70 @@ def _replace_layer_parameters(
         setattr(layer, param_name, param)
 
 
+_CONVERT_EXPERTS_PER_CHUNK = 32
+
+
+def _convert_weight_in_expert_chunks(
+    weight_schema: Any,
+    tensors: dict[str, torch.Tensor],
+    num_experts: int,
+    **kwargs: Any,
+) -> tuple[Any, dict[str, torch.Tensor]]:
+    """``weight_schema.convert_humming`` over a few experts at a time.
+
+    The conversion is per expert, but run on a whole layer it materializes the
+    unpacked codes of every expert at once (8.4 GiB for DeepSeek-V4.1's INT3
+    w13), which can exceed what is free while the model loads. Falls back to
+    one call if a tensor is not per expert or the chunks disagree on the schema
+    or on an output's shape (a conversion may pick a shape from the data, as
+    ``_may_process_global_scale`` does).
+    """
+    chunk = _CONVERT_EXPERTS_PER_CHUNK
+    per_expert = all(t.dim() > 0 and t.size(0) == num_experts for t in tensors.values())
+    if not per_expert or num_experts <= chunk:
+        return weight_schema.convert_humming(
+            tensors=tensors, num_experts=num_experts, **kwargs
+        )
+
+    schema = None
+    outputs: dict[str, torch.Tensor] = {}
+    for start in range(0, num_experts, chunk):
+        end = min(start + chunk, num_experts)
+        part_schema, part = weight_schema.convert_humming(
+            tensors={k: v[start:end] for k, v in tensors.items()},
+            num_experts=end - start,
+            **kwargs,
+        )
+        if schema is None:
+            schema = part_schema
+            if not all(t.dim() > 0 and t.size(0) == end - start for t in part.values()):
+                break
+            outputs = {
+                k: torch.empty(
+                    (num_experts, *t.shape[1:]), dtype=t.dtype, device=t.device
+                )
+                for k, t in part.items()
+            }
+        elif (
+            part_schema != schema
+            or part.keys() != outputs.keys()
+            or any(
+                t.shape[1:] != outputs[k].shape[1:] or t.dtype != outputs[k].dtype
+                for k, t in part.items()
+            )
+        ):
+            break
+        for k, t in part.items():
+            outputs[k][start:end].copy_(t)
+        del part
+    else:
+        return schema, outputs
+    del outputs
+    return weight_schema.convert_humming(
+        tensors=tensors, num_experts=num_experts, **kwargs
+    )
+
+
 def _convert_sublayer_to_humming(
     layer: "RoutedExperts",
     sublayer_name: str,
@@ -362,12 +426,13 @@ def _convert_sublayer_to_humming(
     if sublayer_name == "w13" and layer.moe_config.activation.is_gated:
         shape_n_stacks = [shape_n // 2] * 2
 
-    converted_weight_schema, converted_tensors = weight_schema.convert_humming(
-        tensors=tensors,
+    converted_weight_schema, converted_tensors = _convert_weight_in_expert_chunks(
+        weight_schema,
+        tensors,
+        num_experts,
         shape_n_stacks=shape_n_stacks,
         shape_k_stacks=shape_k_stacks,
         param_dtype=param_dtype,
-        num_experts=num_experts,
     )
 
     converted_input_schema, input_tensors = input_schema.convert_humming(
