@@ -67,6 +67,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.deepseek_v41.common.engram_store import NodeSharedEngramStorage
 from vllm.models.deepseek_v41.common.ops.query_quant import (
     can_fuse_query_quant,
     mxfp8_scale_bytes,
@@ -947,7 +948,7 @@ class ParallelEngramEmbedding(nn.Module):
     """
 
     _weight_loader = staticmethod(_engram_head_shard_weight_loader)
-    _shared_memory: DPSharedEngramStorage | None = None
+    _shared_memory: DPSharedEngramStorage | NodeSharedEngramStorage | None = None
     _packed: torch.Tensor | None = None
 
     def __init__(
@@ -959,13 +960,24 @@ class ParallelEngramEmbedding(nn.Module):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        shared_store: str | None = None,
+        store_identity: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
         assert sum(head_sizes) <= num_embeddings
+        if shared_store is not None and (
+            not cpu_offload or use_thp or dp_shared_memory or store_identity is None
+        ):
+            raise ValueError(
+                "shared_store requires cpu_offload without use_thp or "
+                "dp_shared_memory, and a store identity"
+            )
         self.cpu_offload = cpu_offload
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
+        self.shared_store = shared_store
+        self.store_identity = store_identity
         self.dp_size = get_engram_dp_size()
         if dp_shared_memory:
             if not cpu_offload:
@@ -1024,7 +1036,11 @@ class ParallelEngramEmbedding(nn.Module):
                 self.part_num_embeddings,
                 dim,
                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
-                "shared across DP replicas" if dp_shared_memory else "per rank",
+                "shared across DP replicas"
+                if dp_shared_memory
+                else f"shared across servers via {shared_store}"
+                if shared_store is not None
+                else "per rank",
             )
 
     def _get_shard_info(self) -> tuple[int, int]:
@@ -1042,6 +1058,23 @@ class ParallelEngramEmbedding(nn.Module):
             self._shared_memory = storage
             self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
+        if self.shared_store is not None:
+            assert self.store_identity is not None
+            node_storage = NodeSharedEngramStorage(
+                self.shared_store,
+                {
+                    **self.store_identity,
+                    "rows": [self.vocab_start_idx, self.vocab_end_idx],
+                    "dim": self.dim,
+                    "block_size": self.block_size,
+                },
+                self.part_num_embeddings,
+                self.dim,
+                self.block_size,
+            )
+            self._shared_memory = node_storage
+            self._weight_loader = node_storage.load_weight
+            return node_storage.weight, node_storage.weight_scale_inv
         scale_dim = self.dim // self.block_size
         if not self.cpu_offload:
             return (
@@ -1548,7 +1581,9 @@ class Engram(nn.Module):
         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
         # suffix rule.
-        self.embed_tokens = self._create_embedding(layout, layer_hash_index)
+        self.embed_tokens = self._create_embedding(
+            layout, layer_hash_index, f"{prefix}.embed_tokens"
+        )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         # Without sequence parallelism every TP rank holds every token, so
         # shard the output columns instead of replicating the projection.
@@ -1575,10 +1610,18 @@ class Engram(nn.Module):
         self._init_staging(max_tokens, layout.head_dim)
 
     def _create_embedding(
-        self, layout: EngramLayout, layer_hash_index: int
+        self, layout: EngramLayout, layer_hash_index: int, prefix: str
     ) -> ParallelEngramEmbedding:
-        engram_config = get_current_vllm_config().engram_config
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
         assert engram_config is not None
+        model_config = vllm_config.model_config
+        if (
+            engram_config.shared_store is not None
+            and vllm_config.load_config.load_format == "dummy"
+        ):
+            # Dummy weights fill parameters directly, over other servers' tables.
+            raise ValueError("Engram shared_store cannot be used with dummy weights")
         return ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
@@ -1586,6 +1629,16 @@ class Engram(nn.Module):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            shared_store=engram_config.shared_store,
+            store_identity={
+                "model": model_config.model,
+                "revision": model_config.revision,
+                "layer": prefix,
+                "tp": [
+                    get_tensor_model_parallel_rank(),
+                    get_tensor_model_parallel_world_size(),
+                ],
+            },
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
