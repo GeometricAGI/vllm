@@ -342,6 +342,64 @@ def _replace_layer_parameters(
     )
 
 
+_CONVERT_EXPERTS_PER_CHUNK = 32
+
+
+def _convert_symmetric_integer_weight_in_expert_chunks(
+    schema: Any,
+    tensors: dict[str, torch.Tensor],
+    num_experts: int,
+) -> tuple[Any, dict[str, torch.Tensor]]:
+    """``schema.convert_symmetric_integer_weight`` a few experts at a time.
+
+    On a whole layer it unpacks every expert's codes at once (8.4 GiB for
+    DeepSeek-V4.1's INT3 w13). It recodes each code on its own but keeps the
+    layer's codes unchanged if any code is 0 or a zero point does not center,
+    so one chunk keeping its codes means the whole layer keeps them. Tensors it
+    passes through are not copied. Falls back to one call if a tensor is not
+    per expert or the chunks disagree on the schema or an output's shape.
+    """
+    chunk = _CONVERT_EXPERTS_PER_CHUNK
+    if num_experts <= chunk or any(
+        t.dim() == 0 or t.size(0) != num_experts for t in tensors.values()
+    ):
+        return schema.convert_symmetric_integer_weight(tensors)
+
+    converted_schema = None
+    outputs: dict[str, torch.Tensor] = {}
+    for start in range(0, num_experts, chunk):
+        end = min(start + chunk, num_experts)
+        part_in = {k: v[start:end] for k, v in tensors.items()}
+        part_schema, part = schema.convert_symmetric_integer_weight(part_in)
+        if part_schema is schema:
+            return schema, tensors
+        changed = {k: t for k, t in part.items() if t is not part_in.get(k)}
+        if converted_schema is None:
+            converted_schema = part_schema
+            outputs = {
+                k: torch.empty(
+                    (num_experts, *t.shape[1:]), dtype=t.dtype, device=t.device
+                )
+                for k, t in changed.items()
+            }
+        if (
+            part_schema != converted_schema
+            or part.keys() != tensors.keys()
+            or changed.keys() != outputs.keys()
+            or any(
+                t.shape != (end - start, *outputs[k].shape[1:])
+                or t.dtype != outputs[k].dtype
+                for k, t in changed.items()
+            )
+        ):
+            del part, part_in, changed, outputs
+            return schema.convert_symmetric_integer_weight(tensors)
+        for k, t in changed.items():
+            outputs[k][start:end].copy_(t)
+        del part, part_in, changed
+    return converted_schema, {**tensors, **outputs}
+
+
 def _convert_sublayer_to_humming(
     layer: "RoutedExperts",
     sublayer_name: str,
@@ -365,13 +423,30 @@ def _convert_sublayer_to_humming(
     if sublayer_name == "w13" and layer.moe_config.activation.is_gated:
         shape_n_stacks = [shape_n // 2] * 2
 
-    converted_weight_schema, converted_tensors = weight_schema.convert_humming(
-        tensors=tensors,
-        shape_n_stacks=shape_n_stacks,
-        shape_k_stacks=shape_k_stacks,
-        param_dtype=param_dtype,
-        num_experts=num_experts,
-    )
+    from vllm.utils.humming import BaseWeightSchema
+
+    if isinstance(weight_schema, BaseWeightSchema):
+        converted_weight_schema, converted_tensors = weight_schema.convert_humming(
+            tensors=tensors,
+            shape_n_stacks=shape_n_stacks,
+            shape_k_stacks=shape_k_stacks,
+            param_dtype=param_dtype,
+            num_experts=num_experts,
+            convert_symmetric_integer=False,
+        )
+        converted_weight_schema, converted_tensors = (
+            _convert_symmetric_integer_weight_in_expert_chunks(
+                converted_weight_schema, converted_tensors, num_experts
+            )
+        )
+    else:
+        converted_weight_schema, converted_tensors = weight_schema.convert_humming(
+            tensors=tensors,
+            shape_n_stacks=shape_n_stacks,
+            shape_k_stacks=shape_k_stacks,
+            param_dtype=param_dtype,
+            num_experts=num_experts,
+        )
 
     converted_input_schema, input_tensors = input_schema.convert_humming(
         tensors=tensors,
