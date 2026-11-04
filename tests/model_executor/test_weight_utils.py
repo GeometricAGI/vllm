@@ -268,6 +268,38 @@ def test_checkpoint_weight_mapper_discards_serialized_g_idx():
     assert mapper._map_name("model.layers.0.qweight") == "model.layers.0.qweight"
 
 
+def test_safetensors_weights_iterator_yields_tensors_in_read_order(tmp_path):
+    """Data order keeps a memory-mapped shard's reads sequential; grouping by
+    top-level module keeps each module's tensors one contiguous run, though a
+    shard stores its data grouped by dtype (wider first)."""
+    import torch
+    from safetensors.torch import save_file
+
+    from vllm.model_executor.model_loader.weight_utils import (
+        safetensors_weights_iterator,
+    )
+
+    tensors = {
+        "a.bias": torch.arange(4, dtype=torch.float16),
+        "a.weight": torch.arange(4, dtype=torch.float32),
+        "b.weight": torch.arange(4, dtype=torch.float32) + 4,
+        "c.weight": torch.arange(4, dtype=torch.float16) + 8,
+    }
+    path = str(tmp_path / "model.safetensors")
+    save_file(tensors, path)
+
+    loaded = list(safetensors_weights_iterator([path], use_tqdm_on_load=False))
+
+    assert [name for name, _ in loaded] == [
+        "a.weight",
+        "a.bias",
+        "b.weight",
+        "c.weight",
+    ]
+    for name, tensor in loaded:
+        torch.testing.assert_close(tensor, tensors[name])
+
+
 class TestKvCacheScaleMapper:
     """The `WeightsMapper` returned by `get_cache_scale_mapper` replaces the
     per-model `maybe_remap_kv_scale_name` calls. It must remap the same set of
