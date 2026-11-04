@@ -55,6 +55,13 @@ class EngramConfig:
     startup takes longer. Requires cpu_offload without dp_shared_memory.
     Always on for private tables on ROCm."""
 
+    shared_store: str | None = None
+    """Directory through which servers on one host share a single in-memory
+    copy of each CPU-offloaded table. Servers that set the same directory and
+    load the same checkpoint map one memfd per table instead of each pinning
+    its own; the copy is freed when the last of them exits. Requires
+    cpu_offload, and neither use_thp nor dp_shared_memory."""
+
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
@@ -62,6 +69,13 @@ class EngramConfig:
         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
             raise ValueError(
                 "use_thp requires cpu_offload=True and dp_shared_memory=False"
+            )
+        if self.shared_store is not None and (
+            not self.cpu_offload or self.use_thp or self.dp_shared_memory
+        ):
+            raise ValueError(
+                "shared_store requires cpu_offload=True, use_thp=False and "
+                "dp_shared_memory=False"
             )
         return self
 
@@ -88,12 +102,18 @@ class EngramConfig:
             self.dp_shared_memory = (
                 self.cpu_offload
                 and not self.use_thp
+                and self.shared_store is None
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
             )
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
+        if self.shared_store is not None and parallel_config.data_parallel_size > 1:
+            raise ValueError(
+                "shared_store is for separate single-replica servers; use "
+                "dp_shared_memory with data_parallel_size > 1."
+            )
         if self.dp_shared_memory:
             if parallel_config.data_parallel_size <= 1:
                 raise ValueError("dp_shared_memory requires data_parallel_size > 1.")
@@ -117,4 +137,5 @@ class EngramConfig:
 
     def compute_hash(self) -> str:
         """Hash settings that affect embedding execution and graph structure."""
-        return hash_factors(get_hash_factors(self, set()))
+        # Where a table's host memory comes from does not change execution.
+        return hash_factors(get_hash_factors(self, {"shared_store"}))

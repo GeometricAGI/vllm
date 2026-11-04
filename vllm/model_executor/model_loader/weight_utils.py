@@ -158,6 +158,18 @@ def _natural_sort_key(filepath: str) -> list:
     ]
 
 
+def _safetensors_keys_in_read_order(f: Any) -> list[str]:
+    """A shard's tensor names grouped by top-level module, in data order within
+    each group.
+
+    ``keys()`` is sorted by name, which reads a memory-mapped shard at random
+    offsets; data order lets the kernel read ahead sequentially. A shard stores
+    its data grouped by dtype, so the stable sort by top-level module keeps
+    each top-level module's tensors one contiguous run, as name order did.
+    """
+    return sorted(f.offset_keys(), key=lambda name: name.split(".", 1)[0])
+
+
 def maybe_download_from_modelscope(
     model: str,
     revision: str | None = None,
@@ -1242,7 +1254,7 @@ def safetensors_weights_iterator(
             yield from unflattened_state_dict.items()
         else:
             with safe_open(st_file, framework="pt") as f:
-                for name in f.keys():  # noqa: SIM118
+                for name in _safetensors_keys_in_read_order(f):
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)

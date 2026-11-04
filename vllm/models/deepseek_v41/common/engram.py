@@ -68,6 +68,12 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.deepseek_v41.common.engram_store import (
+    NodeSharedEngramStorage,
+    PackedEngramStorage,
+    engram_head_shard,
+    register_host_memory,
+)
 from vllm.models.deepseek_v41.common.ops.query_quant import (
     can_fuse_query_quant,
     mxfp8_scale_bytes,
@@ -605,16 +611,8 @@ class NgramHashState(nn.Module):
 def _engram_head_shard_weight_loader(
     param: torch.nn.Parameter, loaded_weight: torch.Tensor
 ) -> None:
-    """Load this rank's complete head buckets. ue8m0 scales arrive as
-    float8_e8m0fnu; keep the raw bytes (the param stores uint8)."""
-    part_rows = param.shape[0]
-    if loaded_weight.dtype == torch.float8_e8m0fnu:
-        loaded_weight = loaded_weight.view(torch.uint8)
-    shard = loaded_weight.narrow(0, param.engram_vocab_start, part_rows)
-    assert shard.shape == param.shape, (
-        f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
-    )
-    param.data.copy_(shard)
+    """Load this rank's complete head buckets."""
+    param.data.copy_(engram_head_shard(param, loaded_weight))
 
 
 # Branching on SORTED at runtime intermittently crashes Triton 3.8's
@@ -778,7 +776,7 @@ def gather_engram_hashes(
     return dp_group.all_gather(hash_ids, dim=0)
 
 
-class DPSharedEngramStorage:
+class DPSharedEngramStorage(PackedEngramStorage):
     """Registered host weights shared by a node-local DP group with one writer."""
 
     def __init__(
@@ -787,9 +785,7 @@ class DPSharedEngramStorage:
         self.group = group
         weight_bytes = num_rows * dim
         storage = self._allocate(weight_bytes + weight_bytes // block_size)
-        self.weight = storage[:weight_bytes].view(torch.float8_e4m3fn).view(-1, dim)
-        self.weight_scale_inv = storage[weight_bytes:].view(-1, dim // block_size)
-        self._views: tuple[torch.Tensor, torch.Tensor] | None = None
+        super().__init__(storage, num_rows, dim, block_size)
 
     def _allocate(self, num_bytes: int) -> torch.Tensor:
         """Map and register one physical allocation across a node-local DP group."""
@@ -817,18 +813,7 @@ class DPSharedEngramStorage:
                 with open(path, "r+b") as file:
                     mapping = mmap.mmap(file.fileno(), num_bytes, flags=mmap.MAP_SHARED)
                 owner = np.frombuffer(mapping, dtype=np.uint8)
-                pointer = owner.ctypes.data
-                tensor = torch.from_numpy(owner)
-                result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)
-                if result.value != 0:
-                    raise RuntimeError(f"cudaHostRegister failed: {result}")
-                finalizer = weakref.finalize(owner, self._unregister, mapping, pointer)
-                finalizer.atexit = False  # type: ignore[misc]
-                # The UVA helper otherwise allocates a private pinned copy.
-                if not tensor.is_pinned():
-                    raise RuntimeError(
-                        "cudaHostRegister did not pin the shared Engram mapping"
-                    )
+                tensor = register_host_memory(owner, mapping)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
 
@@ -849,14 +834,6 @@ class DPSharedEngramStorage:
             assert tensor is not None
             return tensor
 
-    @staticmethod
-    def _unregister(mapping: mmap.mmap, pointer: int) -> None:
-        # Torch storage retains the numpy owner, including through cached UVA views.
-        # Keep its mmap alive until CUDA has released the registration.
-        result = torch.cuda.cudart().cudaHostUnregister(pointer)
-        if result.value != 0:
-            logger.warning("Engram cudaHostUnregister failed: %s", result)
-
     def load_weight(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
     ) -> None:
@@ -865,21 +842,6 @@ class DPSharedEngramStorage:
         # Read order may differ across ranks. Equal load counts ensure all shared
         # weights are ready after the last weight-loader call returns.
         torch.distributed.barrier(group=self.group.cpu_group)
-
-    def get_views(
-        self, weight: torch.Tensor, scales: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (weight.data_ptr(), scales.data_ptr()) != (
-            self.weight.data_ptr(),
-            self.weight_scale_inv.data_ptr(),
-        ):
-            raise RuntimeError("Shared Engram parameter storage must not be replaced")
-        if self._views is None:
-            self._views = (
-                get_accelerator_view_from_cpu_tensor(self.weight),
-                get_accelerator_view_from_cpu_tensor(self.weight_scale_inv),
-            )
-        return self._views
 
 
 def can_share_engram_tables(layout: EngramLayout, block_size: int = 32) -> bool:
@@ -929,25 +891,13 @@ def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
     owner = np.frombuffer(mapping, dtype=np.uint8)
     # Fault the pages in before CUDA pins them, so they can be huge.
     owner[:: mmap.PAGESIZE] = 0
-    tensor = torch.from_numpy(owner)
-    pointer = tensor.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)
-    if result.value != 0:
+    try:
+        return register_host_memory(owner, mapping)
+    except RuntimeError as exc:
         logger.warning(
-            "Engram cudaHostRegister failed (%s); using pinned memory.", result
+            "Engram huge-page registration failed (%s); using pinned memory.", exc
         )
         return None
-    # Tensor views retain owner; its finalizer retains mapping until unregister.
-    finalizer = weakref.finalize(
-        owner, DPSharedEngramStorage._unregister, mapping, pointer
-    )
-    finalizer.atexit = False  # type: ignore[misc]
-    if not tensor.is_pinned():
-        logger.warning(
-            "CUDA did not recognize Engram registration; using pinned memory."
-        )
-        return None
-    return tensor
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -958,7 +908,7 @@ class ParallelEngramEmbedding(nn.Module):
     """
 
     _weight_loader = staticmethod(_engram_head_shard_weight_loader)
-    _shared_memory: DPSharedEngramStorage | None = None
+    _shared_memory: DPSharedEngramStorage | NodeSharedEngramStorage | None = None
     _packed: torch.Tensor | None = None
 
     def __init__(
@@ -970,6 +920,8 @@ class ParallelEngramEmbedding(nn.Module):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        shared_store: str | None = None,
+        store_identity: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
@@ -977,6 +929,8 @@ class ParallelEngramEmbedding(nn.Module):
         self.cpu_offload = cpu_offload
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
+        self.shared_store = shared_store
+        self.store_identity = store_identity
         self.dp_size = get_engram_dp_size()
         if dp_shared_memory:
             if not cpu_offload:
@@ -1069,7 +1023,11 @@ class ParallelEngramEmbedding(nn.Module):
                 self.part_num_embeddings,
                 dim,
                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
-                "shared across DP replicas" if dp_shared_memory else "per rank",
+                "shared across DP replicas"
+                if dp_shared_memory
+                else f"shared across servers via {shared_store}"
+                if shared_store is not None
+                else "per rank",
             )
 
     def _get_shard_info(self) -> tuple[int, int]:
@@ -1119,6 +1077,23 @@ class ParallelEngramEmbedding(nn.Module):
             self._shared_memory = storage
             self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
+        if self.shared_store is not None:
+            assert self.store_identity is not None
+            node_storage = NodeSharedEngramStorage(
+                self.shared_store,
+                {
+                    **self.store_identity,
+                    "rows": [self.vocab_start_idx, self.vocab_end_idx],
+                    "dim": self.dim,
+                    "block_size": self.block_size,
+                },
+                self.part_num_embeddings,
+                self.dim,
+                self.block_size,
+            )
+            self._shared_memory = node_storage
+            self._weight_loader = node_storage.load_weight
+            return node_storage.weight, node_storage.weight_scale_inv
         # pin_memory rounds up to a power of two. ROCm pins huge pages either way.
         if self.use_thp or current_platform.is_rocm():
             weight_bytes = self.part_num_embeddings * self.dim
@@ -1622,7 +1597,9 @@ class Engram(nn.Module):
         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
         # suffix rule.
-        self.embed_tokens = self._create_embedding(layout, layer_hash_index)
+        self.embed_tokens = self._create_embedding(
+            layout, layer_hash_index, f"{prefix}.embed_tokens"
+        )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         # Without sequence parallelism every TP rank holds every token, so
         # shard the output columns instead of replicating the projection.
@@ -1649,10 +1626,14 @@ class Engram(nn.Module):
         self._init_staging(max_tokens, layout.head_dim)
 
     def _create_embedding(
-        self, layout: EngramLayout, layer_hash_index: int
+        self, layout: EngramLayout, layer_hash_index: int, prefix: str
     ) -> ParallelEngramEmbedding:
-        engram_config = get_current_vllm_config().engram_config
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
         assert engram_config is not None
+        store_identity = None
+        if engram_config.shared_store is not None:
+            store_identity = self._store_identity(vllm_config, prefix)
         return ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
@@ -1660,7 +1641,36 @@ class Engram(nn.Module):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            shared_store=engram_config.shared_store,
+            store_identity=store_identity,
         )
+
+    @staticmethod
+    def _store_identity(vllm_config: VllmConfig, prefix: str) -> dict[str, object]:
+        """What makes this layer's table the same across servers sharing it."""
+        from vllm.model_executor.model_loader import (
+            _LOAD_FORMAT_TO_MODEL_LOADER,
+            DefaultModelLoader,
+        )
+
+        load_format = vllm_config.load_config.load_format
+        # Other loaders (dummy, sharded_state, ...) write parameters directly
+        # rather than through NodeSharedEngramStorage.load_weight, which would
+        # fault on the read-only shared mapping.
+        if _LOAD_FORMAT_TO_MODEL_LOADER.get(load_format) is not DefaultModelLoader:
+            raise ValueError(
+                f"Engram shared_store cannot be used with load_format={load_format!r}"
+            )
+        model_config = vllm_config.model_config
+        return {
+            "model": model_config.model,
+            "revision": model_config.revision,
+            "layer": prefix,
+            "tp": [
+                get_tensor_model_parallel_rank(),
+                get_tensor_model_parallel_world_size(),
+            ],
+        }
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
         # Persistent storage keeps lookup addresses stable across graph replays.
