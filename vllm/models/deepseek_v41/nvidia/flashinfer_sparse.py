@@ -115,7 +115,9 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
-        return [128]
+        from vllm.platforms import current_platform
+
+        return [64 if current_platform.is_device_capability_family(120) else 128]
 
     @staticmethod
     def get_name() -> str:
