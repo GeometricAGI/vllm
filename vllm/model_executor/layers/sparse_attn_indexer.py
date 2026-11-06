@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -25,6 +27,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask as _apply_candidate_mask,
+)
+from vllm.model_executor.kernels.attention.dsa.candidate_logits_sm120 import (
+    candidate_logits as _sm120_candidate_logits,
+)
+from vllm.model_executor.kernels.attention.dsa.candidate_logits_sm120 import (
+    candidate_topk as _sm120_candidate_topk,
 )
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
@@ -342,6 +350,25 @@ def _gather_workspace_shapes(
     return (
         ((total_seq_lens, head_dim), fp8_dtype),
         ((total_seq_lens, 4), torch.uint8),
+    )
+
+
+# Opt-in: DS4.1 consumer indexer layers on SM120 score only their candidate
+# blocks in decode (FP8 indexer cache), see candidate_logits_sm120.
+_SM120_CANDIDATE_LOGITS = os.environ.get(
+    "VLLM_SM120_INDEXER_CANDIDATE_LOGITS", "0"
+).lower() in ("1", "true")
+
+
+def _use_sm120_candidate_logits(
+    use_fp4_cache: bool, q_scale: torch.Tensor | None
+) -> bool:
+    return (
+        _SM120_CANDIDATE_LOGITS
+        and not use_fp4_cache
+        and q_scale is None
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
     )
 
 
@@ -858,7 +885,48 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        num_rows = num_padded_tokens
+        use_candidate_logits = (
+            candidate_blocks is not None
+            and not candidate_write
+            and _use_sm120_candidate_logits(use_fp4_cache, padded_q_scale)
+        )
+        if use_candidate_logits:
+            # SM120 two-level consumer: score only the candidate blocks
+            # instead of dense logits + candidate mask + full-width top-k.
+            if seq_lens.shape[-1] == num_rows // batch_size:
+                vis = seq_lens.reshape(-1)
+            else:  # (B, 1): the dense kernel's causal mask within next_n
+                vis = (
+                    seq_lens[:, :1]
+                    - next_n
+                    + 1
+                    + torch.arange(next_n, device=seq_lens.device, dtype=seq_lens.dtype)
+                ).reshape(-1)
+            decode_candidates = candidate_blocks[:num_rows]
+            compact = _sm120_candidate_logits(
+                padded_q_quant_decode_tokens.reshape(
+                    num_rows, *padded_q_quant_decode_tokens.shape[2:]
+                ),
+                weights[:num_rows],
+                kv_cache.squeeze(-2),
+                decode_metadata.block_table,
+                vis,
+                decode_candidates,
+                candidate_block_size,
+                next_n,
+            )
+            topk_indices = topk_indices_buffer[:num_rows, :topk_tokens]
+            _sm120_candidate_topk(
+                compact,
+                decode_candidates,
+                candidate_block_size,
+                topk_tokens,
+                topk_indices,
+                next_n,
+                get_indexer_topk(topk_backend),
+            )
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -891,47 +959,48 @@ def sparse_attn_indexer(
             # DCP need fp32. SM100 decode is varlen: one context length per row.
             if topk_backend != "deep_select" or dcp_world_size != 1:
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
-        num_rows = logits.shape[0]
-        if candidate_blocks is not None:
-            # Two-level selection (v4.1) on the decode logits; columns are
-            # request-local compressed positions. seq_lens is (B, next_n)
-            # for native spec decode (per-row effective lens) and (B, 1)
-            # otherwise.
-            vis = seq_lens.reshape(-1)
-            row_repeat = next_n if vis.numel() != num_rows else 1
-            vis = vis[:num_rows]
-            decode_candidates = candidate_blocks[:num_rows]
-            if candidate_write:
-                _select_candidate_blocks(
-                    logits,
-                    None,
-                    vis,
-                    decode_candidates.shape[1],
-                    candidate_block_size,
-                    decode_candidates,
-                    row_repeat,
-                )
-            else:
-                _apply_candidate_mask(
-                    logits,
-                    None,
-                    vis,
-                    decode_candidates,
-                    candidate_block_size,
-                    row_repeat,
-                )
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        if not use_candidate_logits:
+            num_rows = logits.shape[0]
+            if candidate_blocks is not None:
+                # Two-level selection (v4.1) on the decode logits; columns are
+                # request-local compressed positions. seq_lens is (B, next_n)
+                # for native spec decode (per-row effective lens) and (B, 1)
+                # otherwise.
+                vis = seq_lens.reshape(-1)
+                row_repeat = next_n if vis.numel() != num_rows else 1
+                vis = vis[:num_rows]
+                decode_candidates = candidate_blocks[:num_rows]
+                if candidate_write:
+                    _select_candidate_blocks(
+                        logits,
+                        None,
+                        vis,
+                        decode_candidates.shape[1],
+                        candidate_block_size,
+                        decode_candidates,
+                        row_repeat,
+                    )
+                else:
+                    _apply_candidate_mask(
+                        logits,
+                        None,
+                        vis,
+                        decode_candidates,
+                        candidate_block_size,
+                        row_repeat,
+                    )
+            topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        # The backend comes from the layer (config is only readable at model
-        # construction); dispatchers are cached per backend.
-        get_indexer_topk(topk_backend)(
-            logits,
-            seq_lens,
-            next_n,
-            topk_indices,
-            topk_tokens,
-            attn_metadata_narrowed.max_seq_len,
-        )
+            # The backend comes from the layer (config is only readable at model
+            # construction); dispatchers are cached per backend.
+            get_indexer_topk(topk_backend)(
+                logits,
+                seq_lens,
+                next_n,
+                topk_indices,
+                topk_tokens,
+                attn_metadata_narrowed.max_seq_len,
+            )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
