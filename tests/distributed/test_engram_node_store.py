@@ -4,6 +4,7 @@
 
 import gc
 import json
+import mmap
 import multiprocessing
 import os
 import signal
@@ -229,6 +230,69 @@ def test_the_table_cannot_be_written_outside_load_weight(tmp_path):
     process.start()
     process.join(60)
     assert process.exitcode == -signal.SIGSEGV
+
+
+def permissions(address: int) -> str:
+    """The protection of the mapping holding ``address``, as /proc/self/maps
+    gives it (``r--s``, ``rw-s``)."""
+    for line in Path("/proc/self/maps").read_text().splitlines():
+        span, perms = line.split()[:2]
+        start, end = (int(bound, 16) for bound in span.split("-"))
+        if start <= address < end:
+            return perms
+    raise AssertionError(f"{address:#x} is not mapped")
+
+
+class TestReadOnlyRegistration:
+    """How the store pins its read-only mapping, with or without the device's
+    read-only registration."""
+
+    @pytest.fixture
+    def table(self):
+        fd = os.memfd_create("engram_test", os.MFD_CLOEXEC)
+        os.ftruncate(fd, 1 << 20)
+        mapping = mmap.mmap(fd, 1 << 20, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+        yield np.frombuffer(mapping, dtype=np.uint8), mapping
+        os.close(fd)
+
+    def register(self, seen: list):
+        def fake(owner, mapping, flags=0):
+            seen.append((flags, permissions(owner.ctypes.data)))
+            return unpinned(owner, mapping)
+
+        return fake
+
+    def test_a_device_with_read_only_registration_registers_it_read_only(self, table):
+        owner, mapping = table
+        seen: list = []
+        engram_store.register_read_only(
+            owner, mapping, supported=lambda: True, register=self.register(seen)
+        )
+        assert seen == [(engram_store._CUDA_HOST_REGISTER_READ_ONLY, "r--s")]
+        assert permissions(owner.ctypes.data) == "r--s"
+
+    def test_a_device_without_it_registers_it_writable_and_maps_it_read_only(
+        self, table
+    ):
+        owner, mapping = table
+        seen: list = []
+        engram_store.register_read_only(
+            owner, mapping, supported=lambda: False, register=self.register(seen)
+        )
+        assert seen == [(0, "rw-s")]
+        assert permissions(owner.ctypes.data) == "r--s"
+
+    def test_a_failed_registration_leaves_it_read_only(self, table):
+        owner, mapping = table
+
+        def refuse(owner, mapping, flags=0):
+            raise RuntimeError("cudaHostRegister failed")
+
+        with pytest.raises(RuntimeError, match="cudaHostRegister failed"):
+            engram_store.register_read_only(
+                owner, mapping, supported=lambda: False, register=refuse
+            )
+        assert permissions(owner.ctypes.data) == "r--s"
 
 
 def test_shared_store_excludes_the_other_host_storage_modes():
