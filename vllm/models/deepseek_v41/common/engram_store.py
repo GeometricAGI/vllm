@@ -19,9 +19,11 @@ server holds the table's lock. A later server compares its checkpoint shard
 byte for byte with the table and skips the copy when they match, or refuses
 to start when they differ. Servers map the table read-only, so only
 ``load_weight`` can write it; any other write faults instead of changing a
-table another server is serving.
+table another server is serving. A device that cannot register read-only
+memory gets the mapping made writable for its registration only.
 """
 
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -37,6 +39,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
@@ -45,6 +48,10 @@ logger = init_logger(__name__)
 # cudaHostRegisterReadOnly: the device only reads the registered range, which
 # CUDA requires to register a mapping without write access.
 _CUDA_HOST_REGISTER_READ_ONLY = 0x08
+# cudaDevAttrHostRegisterReadOnlySupported: whether the device takes that flag.
+_CUDA_DEV_ATTR_HOST_REGISTER_READ_ONLY_SUPPORTED = 113
+
+_libc = ctypes.CDLL(None, use_errno=True)
 
 
 def engram_head_shard(
@@ -93,8 +100,56 @@ def register_host_memory(
     return tensor
 
 
-def register_read_only(owner: np.ndarray, mapping: mmap.mmap) -> torch.Tensor:
-    return register_host_memory(owner, mapping, _CUDA_HOST_REGISTER_READ_ONLY)
+def read_only_registration_supported() -> bool:
+    """Whether the current device can register a mapping without write access.
+
+    Asked before registering, since a refused cudaHostRegister leaves its error
+    pending, and torch then raises it at the next kernel launch.
+    """
+    value = ctypes.c_int()
+    cudart = CudaRTLibrary().lib
+    result = cudart.cudaDeviceGetAttribute(
+        ctypes.byref(value),
+        _CUDA_DEV_ATTR_HOST_REGISTER_READ_ONLY_SUPPORTED,
+        torch.cuda.current_device(),
+    )
+    if result != 0:
+        raise RuntimeError(f"cudaDeviceGetAttribute failed: {result}")
+    return value.value != 0
+
+
+def _mprotect(pointer: int, nbytes: int, prot: int) -> None:
+    if _libc.mprotect(ctypes.c_void_p(pointer), ctypes.c_size_t(nbytes), prot) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"mprotect failed: {os.strerror(errno)}")
+
+
+def register_read_only(
+    owner: np.ndarray,
+    mapping: mmap.mmap,
+    supported: Callable[[], bool] = read_only_registration_supported,
+    register: Callable[..., torch.Tensor] = register_host_memory,
+) -> torch.Tensor:
+    """Pin a read-only mapping, which stays read-only to the CPU.
+
+    Where CUDA registers only writable memory (some virtualized GPUs, such as
+    Verda's B300 VMs, report no read-only registration), the mapping is made
+    writable for the registration and read-only again before anything else
+    sees it. The pages stay pinned, and a CPU write still faults; only a write
+    from the device is no longer refused.
+    """
+    if supported():
+        return register(owner, mapping, _CUDA_HOST_REGISTER_READ_ONLY)
+    logger.info_once(
+        "The device cannot register read-only host memory; the Engram store "
+        "registers its tables writable and maps them read-only again"
+    )
+    pointer = owner.ctypes.data
+    _mprotect(pointer, owner.nbytes, mmap.PROT_READ | mmap.PROT_WRITE)
+    try:
+        return register(owner, mapping)
+    finally:
+        _mprotect(pointer, owner.nbytes, mmap.PROT_READ)
 
 
 class PackedEngramStorage:
