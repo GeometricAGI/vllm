@@ -4,6 +4,7 @@
 
 import json
 import math
+import threading
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -84,6 +85,53 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_EXPERT_CV_LOCK = threading.Lock()
+
+
+def _expert_cv_tuning_config(cv: float, **kwargs: Any) -> list:
+    """Humming's MoE tuning table, built as if per-expert load had CV `cv`.
+
+    Humming's heuristic samples expert loads from a gamma model whose CV is the
+    class attribute ``expert_probability_cv`` of its device heuristics classes,
+    with no per-call parameter. Set it on every such class, build the table,
+    and restore it. Humming caches tables by layer and shape but not by CV, so
+    that cache is cleared on both sides. Its inner sampling caches key on the CV.
+    """
+    import humming.tune as tune
+    import humming.tune.base as tune_base
+
+    from vllm.utils.humming import get_heuristics_config
+
+    classes: set[type] = set()
+    pending = [tune_base.DeviceHeuristics]
+    while pending:
+        cls = pending.pop()
+        classes.add(cls)
+        pending.extend(c for c in cls.__subclasses__() if c not in classes)
+    missing = object()
+    with _EXPERT_CV_LOCK:
+        saved = {c: c.__dict__.get("expert_probability_cv", missing) for c in classes}
+        for c in classes:
+            c.expert_probability_cv = cv
+        tune._get_heuristics_config.cache_clear()
+        try:
+            return get_heuristics_config(**kwargs)
+        finally:
+            for c, value in saved.items():
+                if value is missing:
+                    del c.expert_probability_cv
+                else:
+                    c.expert_probability_cv = value
+            tune._get_heuristics_config.cache_clear()
+
+
+def _merge_tuning_configs(low: list, high: list, split: int) -> list:
+    """Entries ``[lo, hi, config]`` (``lo < shape_m <= hi``): `low` up to `split`,
+    `high` above it."""
+    merged = [[lo, min(hi, split), cfg] for lo, hi, cfg in low if lo < split]
+    merged += [[max(lo, split), hi, cfg] for lo, hi, cfg in high if hi > split]
+    return merged
+
 
 def _is_supported_wna16_weight_key(weight_key: QuantKey | None) -> bool:
     if weight_key is None or weight_key.scale2 is not None:
@@ -144,6 +192,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         self.num_experts = moe_config.num_local_experts
         self.global_num_experts = moe_config.num_experts
         self.quant_config = humming_quant_config
+        self.humming_top_k = moe_config.experts_per_token
         self.init_humming_moe()
 
         if self.is_batched():
@@ -176,6 +225,30 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
             gemm_type=self.humming_gemm_type(),
         )
+        cv = envs.VLLM_HUMMING_MOE_EXPERT_CV
+        if cv is not None:
+            # Tables are indexed by routed rows: tokens x top-k.
+            split = envs.VLLM_HUMMING_MOE_EXPERT_CV_MIN_TOKENS * self.humming_top_k
+            for name in ("w13", "w2"):
+                skewed = _expert_cv_tuning_config(
+                    cv,
+                    layer_config=self.humming_configs[name],
+                    use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
+                    use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
+                    gemm_type=self.humming_gemm_type(),
+                )
+                attr = f"{name}_tuning_config"
+                setattr(
+                    self,
+                    attr,
+                    _merge_tuning_configs(getattr(self, attr), skewed, split),
+                )
+            logger.info_once(
+                "Humming MoE tile tables built for expert load CV %.2f at "
+                "steps of %d tokens and more",
+                cv,
+                envs.VLLM_HUMMING_MOE_EXPERT_CV_MIN_TOKENS,
+            )
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
