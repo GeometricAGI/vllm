@@ -1607,17 +1607,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_HUMMING_MOE_GEMM_TYPE", None
     ),
     # The coefficient of variation of per-expert load that Humming's MoE tile
-    # heuristic assumes (Humming's default is 0.25, near-uniform routing). A
-    # model whose real routing is more skewed picks better tiles from tables
-    # built for its measured CV (DeepSeek-V4.1-Flash: ~1.5 at 4k-token steps).
-    # Unset keeps Humming's tables unchanged.
+    # heuristic assumes (humming-kernels 0.1.17: 0.25; 0.1.18 and later: 0.0,
+    # uniform; older versions have no such setting, and this is ignored with a
+    # warning). A model whose real routing is more skewed picks better tiles
+    # from tables built for its measured CV (DeepSeek-V4.1-Flash: ~1.5 at
+    # 4k-token steps, measured on B300 with 0.1.17). Unset keeps Humming's
+    # tables unchanged.
     "VLLM_HUMMING_MOE_EXPERT_CV": lambda: (
         float(os.environ["VLLM_HUMMING_MOE_EXPERT_CV"])
         if os.environ.get("VLLM_HUMMING_MOE_EXPERT_CV")
         else None
     ),
-    # Steps of at least this many tokens use the VLLM_HUMMING_MOE_EXPERT_CV
-    # tables; smaller steps keep Humming's default tables.
+    # Steps of at least this many tokens (summed across DP ranks, as Humming's
+    # table lookup counts them) use the VLLM_HUMMING_MOE_EXPERT_CV tables;
+    # smaller steps keep Humming's default tables.
     "VLLM_HUMMING_MOE_EXPERT_CV_MIN_TOKENS": lambda: int(
         os.environ.get("VLLM_HUMMING_MOE_EXPERT_CV_MIN_TOKENS", "4097")
     ),
