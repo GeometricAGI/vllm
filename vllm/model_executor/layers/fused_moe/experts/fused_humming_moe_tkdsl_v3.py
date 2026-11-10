@@ -1,9 +1,10 @@
-"""v3 HummingIndexedExperts.apply: INT3 (group 128) routed experts, decode path m <= 64 in new TKDSL kernels.
+"""v3 HummingIndexedExperts.apply: INT3 (group 128) routed experts, decode path m <= 128 in new TKDSL kernels.
 
-Decode (m <= 64): routing prep (per-expert pick lists, a list of active (expert, 4-token pass) work units) ->
-INT3 gate/up grouped GEMV -> clamped SwiGLU -> INT3 down grouped GEMV (top-k weight applied) -> bf16.  The GEMVs are
-stream-K: every CTA takes one contiguous, equal range of 128-K stages over (pass, N tile, K group), so the grid ends
-together whatever the routing.  m > 64 calls #54's apply (its tcgen05 prefill path) unchanged.
+Decode (m <= 128, which covers DSpark verify steps of 32 sequences x 4 tokens): routing prep (per-expert pick
+lists, a list of active (expert, 4-token pass) work units) -> INT3 gate/up grouped GEMV -> clamped SwiGLU -> INT3
+down grouped GEMV (top-k weight applied) -> bf16.  The GEMVs are stream-K: every CTA takes one contiguous, equal range
+of 128-K stages over (pass, N tile, K group), so the grid ends together whatever the routing.  m > 128 calls #54's
+apply unchanged.
 """
 
 import torch
@@ -16,8 +17,8 @@ K1, N1 = 5120, 4608
 I2 = 2304
 K2, N2 = 2304, 5120
 TOPK = 6
-CAP = 64          # max picks per expert on the decode path (m <= 64, ids distinct per token)
-DECODE_MAX = 64
+CAP = 128         # max picks per expert on the decode path (m <= 128, ids distinct per token)
+DECODE_MAX = 128
 
 WPR1 = N1 * 3 // 2               # u32 words per 16-K row of w13
 W1E = (K1 // 16) * WPR1          # words per expert of w13
