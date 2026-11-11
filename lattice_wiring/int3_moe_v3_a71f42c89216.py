@@ -1,9 +1,9 @@
 """INT3 (group 128) routed experts of DeepSeek-V4.1-Flash (32 of 40 layers), v3 decode path.
 
 The original is #54's TKDSL `apply` (fused_humming_moe_tkdsl.py), which the engine runs today at
-HummingIndexedExperts.apply. m <= 64: routing prep, INT3 gate/up grouped GEMV (gemm_gu, 5120 -> 4608), clamped
-SwiGLU (_swiglu_k), INT3 down grouped GEMV (gemm_dn, 2304 -> 5120) and f32 -> bf16 (_cvt_k). m > 64: #54's
-tcgen05 prefill path (s_gemm1 / s_gemm2), which the new code must call unchanged.
+HummingIndexedExperts.apply. m <= 128: routing prep, INT3 gate/up grouped GEMV (gemm_gu, 5120 -> 4608), clamped
+SwiGLU (_swiglu_k), INT3 down grouped GEMV (gemm_dn, 2304 -> 5120) and f32 -> bf16 (_cvt_k). m > 128: #54's
+apply (Humming up to 8447 tokens, its tcgen05 prefill path above), which the new code must call unchanged.
 """
 import torch
 from lattice_kernel_harness import Case, close_within_noise
@@ -19,12 +19,17 @@ CALL_SITE = "vllm.model_executor.layers.fused_moe.experts.fused_humming_moe:Humm
 # Profile token counts: 64 (decode, 71.6% of GPU time), 16384 (mixed chunk, 19.5%), the partial chunks 8281-8283
 # and 11075-11799, 3580/3697, and the decode ramp 24-56. Plus 1, 8 and 17 (odd) for the tails, and the
 # mixed-step capture sizes 128/512.
-TOKEN_COUNTS = (1, 8, 17, 24, 32, 40, 48, 56, 64, 128, 512, 3580, 8283, 11799, 16384)
+# With DSpark verification at max-num-seqs 32 (prod DeepSeek-V4.1-Flash-1017, profiled 2026-11-09), 47-60% of
+# steps carry 65-128 tokens (32 sequences x up to 4 tokens) and ran Humming at about 61% of GPU time: 65 (odd),
+# 72, 96, 120 and 128 cover them, and the padded 128-row batch below is the full verify graph with idle seqs.
+TOKEN_COUNTS = (1, 8, 17, 24, 32, 40, 48, 56, 64, 65, 72, 96, 120, 128, 512, 3580, 8283, 11799, 16384)
 WEIGHTS = {1: 0.003, 8: 0.002, 17: 0.002, 24: 0.0005, 32: 0.0005, 40: 0.0005, 48: 0.0005, 56: 0.0006,
-           64: 0.70, 128: 0.004, 512: 0.004, 3580: 0.0011, 8283: 0.012, 11799: 0.003, 16384: 0.195}
+           64: 0.25, 65: 0.005, 72: 0.03, 96: 0.10, 120: 0.10, 128: 0.30, 512: 0.004, 3580: 0.0011, 8283: 0.012,
+           11799: 0.003, 16384: 0.12}
 # Padded batches as the engine sends them: rows padded up to a CUDA-graph size get expert id -1 and weight 0
 # (VLLM_MOE_SKIP_PADDING); capture warm-up runs batches that are all padding. (m, padded rows, weight).
-PADDED = ((1, 1, 0.0005), (64, 8, 0.02), (64, 64, 0.0005), (512, 512, 0.0005), (3580, 100, 0.0005))
+PADDED = ((1, 1, 0.0005), (64, 8, 0.02), (64, 64, 0.0005), (128, 24, 0.02), (128, 128, 0.0005), (512, 512, 0.0005),
+          (3580, 100, 0.0005))
 
 _CACHE = {}
 
@@ -195,7 +200,7 @@ TASK = ModuleTask(
     entry="apply",
     cases=tuple(Case(f"m{m}", {"m": m}, weight=WEIGHTS[m]) for m in TOKEN_COUNTS)
     + tuple(Case(f"m{m}p{pad}", {"m": m, "pad": pad}, weight=w) for m, pad, w in PADDED),
-    dev_cases=("m64", "m64p8", "m17"),
+    dev_cases=("m64", "m128", "m128p24", "m17"),
     make_inputs=make_inputs,
     baseline=baseline,
     compare=compare,
