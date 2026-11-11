@@ -4,6 +4,7 @@
 
 import json
 import math
+import threading
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -85,6 +86,84 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Guards Humming's process-global expert CV while a table is built for another
+# CV, and the table builds that could otherwise see it patched.
+_EXPERT_CV_LOCK = threading.Lock()
+_EXPERT_CV_TABLES: dict[tuple, list] = {}
+
+
+def _humming_heuristics_classes() -> list[type] | None:
+    """Every Humming device heuristics class, or None when this Humming has no
+    ``expert_probability_cv`` (humming-kernels < 0.1.17)."""
+    import humming.tune  # noqa: F401 - imports every device's heuristics
+    import humming.tune.base as tune_base
+
+    if "expert_probability_cv" not in vars(tune_base.DeviceHeuristics):
+        return None
+    classes = [tune_base.DeviceHeuristics]
+    for cls in classes:
+        classes.extend(c for c in cls.__subclasses__() if c not in classes)
+    return classes
+
+
+def _expert_cv_tuning_config(
+    cv: float,
+    layer_config: "HummingLayerConfig",
+    use_f16_accum: bool,
+    use_batch_invariant: bool,
+    gemm_type: "HummingGemmType",
+) -> list | None:
+    """Humming's MoE tuning table, built as if per-expert load had CV `cv`, or
+    None when this Humming has no expert CV.
+
+    Humming's heuristic samples expert loads from a gamma model whose CV is the
+    class attribute ``expert_probability_cv`` of its device heuristics classes,
+    with no per-call parameter. Set it on every such class, build the table,
+    and restore it. Humming caches tables by layer and shape but not by CV, so
+    that cache is cleared on both sides; its inner sampling caches key on the
+    CV. Tables are memoized here, so layers with the same config build once.
+    """
+    import humming.tune as tune
+
+    from vllm.utils.humming import get_heuristics_config
+
+    key = (cv, layer_config, use_f16_accum, use_batch_invariant, str(gemm_type))
+    with _EXPERT_CV_LOCK:
+        if key in _EXPERT_CV_TABLES:
+            return _EXPERT_CV_TABLES[key]
+        classes = _humming_heuristics_classes()
+        if classes is None:
+            return None
+        missing = object()
+        saved = {c: c.__dict__.get("expert_probability_cv", missing) for c in classes}
+        for c in classes:
+            c.expert_probability_cv = cv
+        tune._get_heuristics_config.cache_clear()
+        try:
+            table = get_heuristics_config(
+                layer_config=layer_config,
+                use_f16_accum=use_f16_accum,
+                use_batch_invariant=use_batch_invariant,
+                gemm_type=gemm_type,
+            )
+        finally:
+            for c, value in saved.items():
+                if value is missing:
+                    del c.expert_probability_cv
+                else:
+                    c.expert_probability_cv = value
+            tune._get_heuristics_config.cache_clear()
+        _EXPERT_CV_TABLES[key] = table
+        return table
+
+
+def _merge_tuning_configs(low: list, high: list, split: int) -> list:
+    """Entries ``[lo, hi, config]`` (``lo < shape_m <= hi``): `low` up to `split`,
+    `high` above it."""
+    merged = [[lo, min(hi, split), cfg] for lo, hi, cfg in low if lo < split]
+    merged += [[max(lo, split), hi, cfg] for lo, hi, cfg in high if hi > split]
+    return merged
+
 
 def _is_supported_wna16_weight_key(weight_key: QuantKey | None) -> bool:
     if weight_key is None or weight_key.scale2 is not None:
@@ -145,6 +224,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         self.num_experts = moe_config.num_local_experts
         self.global_num_experts = moe_config.num_experts
         self.quant_config = humming_quant_config
+        self.humming_top_k = moe_config.experts_per_token
         self.init_humming_moe()
 
         if self.is_batched():
@@ -165,21 +245,74 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
             "gemm_type": self.humming_gemm_type().value,
         }
-        self.w13_tuning_config = get_heuristics_config(
-            layer_config=self.humming_configs["w13"],
-            use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
-            use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
-            gemm_type=self.humming_gemm_type(),
-        )
-        self.w2_tuning_config = get_heuristics_config(
-            layer_config=self.humming_configs["w2"],
-            use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
-            use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
-            gemm_type=self.humming_gemm_type(),
-        )
+        with _EXPERT_CV_LOCK:
+            self.w13_tuning_config = get_heuristics_config(
+                layer_config=self.humming_configs["w13"],
+                use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
+                use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
+                gemm_type=self.humming_gemm_type(),
+            )
+            self.w2_tuning_config = get_heuristics_config(
+                layer_config=self.humming_configs["w2"],
+                use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
+                use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
+                gemm_type=self.humming_gemm_type(),
+            )
+        if envs.VLLM_HUMMING_MOE_EXPERT_CV is not None:
+            self._use_expert_cv_tables(
+                envs.VLLM_HUMMING_MOE_EXPERT_CV,
+                envs.VLLM_HUMMING_MOE_EXPERT_CV_MIN_TOKENS,
+            )
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
+
+    def _use_expert_cv_tables(self, cv: float, min_tokens: int) -> None:
+        """Use tables built for expert-load CV `cv` at steps of at least
+        `min_tokens` tokens (VLLM_HUMMING_MOE_EXPERT_CV).
+
+        The tables are looked up by estimate_local_valid_shape_m: tokens
+        (summed across DP ranks) x top-k, scaled to this rank's share of the
+        experts. The split is in those units, so the threshold counts the same
+        tokens; with expert parallelism it is exact only to the rounding there.
+        """
+        import humming.tune.base as tune_base
+
+        tables = {}
+        for name in ("w13", "w2"):
+            table = _expert_cv_tuning_config(
+                cv,
+                self.humming_configs[name],
+                envs.VLLM_HUMMING_USE_F16_ACCUM,
+                envs.VLLM_BATCH_INVARIANT,
+                self.humming_gemm_type(),
+            )
+            if table is None:
+                logger.warning_once(
+                    "VLLM_HUMMING_MOE_EXPERT_CV is set, but this Humming has no "
+                    "expert_probability_cv (it needs humming-kernels 0.1.17 or later): "
+                    "ignoring it"
+                )
+                return
+            tables[name] = table
+        split = math.ceil(
+            (min_tokens - 1)
+            * self.humming_top_k
+            * self.num_experts
+            / self.global_num_experts
+        )
+        for name, table in tables.items():
+            attr = f"{name}_tuning_config"
+            setattr(
+                self, attr, _merge_tuning_configs(getattr(self, attr), table, split)
+            )
+        logger.info_once(
+            "Humming MoE tile tables built for expert load CV %.2f (Humming's "
+            "default: %.2f) at steps of %d tokens and more",
+            cv,
+            tune_base.DeviceHeuristics.expert_probability_cv,
+            min_tokens,
+        )
 
     def process_input(
         self,
