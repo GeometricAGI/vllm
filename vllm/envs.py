@@ -196,6 +196,8 @@ if TYPE_CHECKING:
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
+    VLLM_HUMMING_MOE_EXPERT_CV: float | None = None
+    VLLM_HUMMING_MOE_EXPERT_CV_MIN_TOKENS: int = 4097
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1641,6 +1643,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # if None, choose better gemm type automatically
     "VLLM_HUMMING_MOE_GEMM_TYPE": lambda: os.environ.get(
         "VLLM_HUMMING_MOE_GEMM_TYPE", None
+    ),
+    # The coefficient of variation of per-expert load that Humming's MoE tile
+    # heuristic assumes (humming-kernels 0.1.17: 0.25; 0.1.18 and later: 0.0,
+    # uniform; older versions have no such setting, and this is ignored with a
+    # warning). A model whose real routing is more skewed picks better tiles
+    # from tables built for its measured CV (DeepSeek-V4.1-Flash: ~1.5 at
+    # 4k-token steps, measured on B300 with 0.1.17). Unset keeps Humming's
+    # tables unchanged.
+    "VLLM_HUMMING_MOE_EXPERT_CV": lambda: (
+        float(os.environ["VLLM_HUMMING_MOE_EXPERT_CV"])
+        if os.environ.get("VLLM_HUMMING_MOE_EXPERT_CV")
+        else None
+    ),
+    # Steps of at least this many tokens (summed across DP ranks, as Humming's
+    # table lookup counts them) use the VLLM_HUMMING_MOE_EXPERT_CV tables;
+    # smaller steps keep Humming's default tables.
+    "VLLM_HUMMING_MOE_EXPERT_CV_MIN_TOKENS": lambda: int(
+        os.environ.get("VLLM_HUMMING_MOE_EXPERT_CV_MIN_TOKENS", "4097")
     ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with
