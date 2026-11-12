@@ -307,8 +307,8 @@ def test_shared_store_excludes_the_other_host_storage_modes():
 
 def test_shared_store_does_not_change_the_compilation_hash():
     assert (
-        EngramConfig(shared_store="/dev/shm/engram").compute_hash()
-        == EngramConfig().compute_hash()
+        EngramConfig(shared_store="/dev/shm/engram").compile_factors()
+        == EngramConfig().compile_factors()
     )
 
 
