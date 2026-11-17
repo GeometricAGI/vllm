@@ -609,8 +609,15 @@ class NgramHashState(nn.Module):
         return output
 
 
+# A table of at least this many bytes is read from its file when it is not in
+# memory already.
+_ENGRAM_DIRECT_BYTES = 64 << 20
 # The bytes of an engram table read from its file at a time.
 _ENGRAM_READ_BYTES = 1 << 30
+# The buffer, and the block size it is a multiple of, that aligned reads go
+# through on a filesystem whose direct reads must be block-aligned.
+_ENGRAM_ALIGNED_BYTES = 64 << 20
+_ENGRAM_BLOCK_BYTES = 4096
 # A table is read from its file, not copied from the mapping, when less than
 # this share of it is already in memory.
 _ENGRAM_RESIDENT_SHARE = 0.9
@@ -652,10 +659,50 @@ def _resident_share(pointer: int, nbytes: int) -> float:
     return int((np.frombuffer(resident, dtype=np.uint8) & 1).sum()) / pages
 
 
+def _read_unaligned(fd: int, target: memoryview, offset: int) -> bool:
+    """Read straight into ``target``; False where the filesystem refuses a
+    direct read at an unaligned offset or address (it raises ``EINVAL``)."""
+    done = 0
+    try:
+        while done < len(target):
+            got = os.preadv(
+                fd, [target[done : done + _ENGRAM_READ_BYTES]], offset + done
+            )
+            if got <= 0:
+                return False
+            done += got
+    except OSError:
+        return False
+    return True
+
+
+def _read_aligned(fd: int, target: memoryview, offset: int) -> bool:
+    """Read whole blocks into a page-aligned buffer and copy out of it, for a
+    filesystem whose direct reads must be block-aligned."""
+    done = 0
+    try:
+        with (
+            mmap.mmap(-1, _ENGRAM_ALIGNED_BYTES) as buffer,
+            memoryview(buffer) as blocks,
+        ):
+            while done < len(target):
+                start = (offset + done) // _ENGRAM_BLOCK_BYTES * _ENGRAM_BLOCK_BYTES
+                skip = offset + done - start
+                got = os.preadv(fd, [blocks], start)
+                if got <= skip:
+                    return False
+                take = min(got - skip, len(target) - done)
+                target[done : done + take] = blocks[skip : skip + take]
+                done += take
+    except OSError:
+        return False
+    return True
+
+
 def _read_from_file(destination: torch.Tensor, path: str, offset: int) -> bool:
     """Fill ``destination`` with the file's bytes from ``offset``, past the
     page cache. False, with ``destination`` in an unknown state, where the
-    filesystem does not read that way."""
+    filesystem has no direct I/O."""
     if sys.platform != "linux":
         return False
     nbytes = destination.numel() * destination.element_size()
@@ -667,19 +714,9 @@ def _read_from_file(destination: torch.Tensor, path: str, offset: int) -> bool:
         target = memoryview(
             (ctypes.c_char * nbytes).from_address(destination.data_ptr())
         ).cast("B")
-        done = 0
-        while done < nbytes:
-            piece = target[done : done + _ENGRAM_READ_BYTES]
-            got = os.preadv(fd, [piece], offset + done)
-            if got <= 0:
-                return False
-            done += got
-    except OSError:
-        # A filesystem that wants direct reads aligned to its blocks.
-        return False
+        return _read_unaligned(fd, target, offset) or _read_aligned(fd, target, offset)
     finally:
         os.close(fd)
-    return True
 
 
 def _engram_head_shard_weight_loader(
@@ -690,13 +727,13 @@ def _engram_head_shard_weight_loader(
     A table of tens of GiB arrives memory-mapped, and copying it fills the page
     cache, which a host with little RAM beyond the pinned tables cannot hold.
     A table not yet in memory is therefore read from its file with direct I/O;
-    a filesystem that cannot read that way falls back to the copy.
+    a filesystem without it falls back to the copy.
     """
     shard = engram_head_shard(param, loaded_weight)
     destination = param.data
     nbytes = shard.numel() * shard.element_size()
     if (
-        nbytes > _ENGRAM_READ_BYTES
+        nbytes >= _ENGRAM_DIRECT_BYTES
         and shard.dtype == destination.dtype
         and shard.device.type == "cpu"
         and destination.device.type == "cpu"
@@ -717,6 +754,12 @@ def _engram_head_shard_weight_loader(
                     nbytes / 2**20 / max(seconds, 1e-9),
                 )
                 return
+            logger.warning(
+                "Could not read an engram table of %.2f GiB from %s with direct "
+                "I/O; copying it through the page cache.",
+                nbytes / 2**30,
+                backing[0],
+            )
     destination.copy_(shard)
 
 

@@ -1,98 +1,97 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Loading an engram table's shard of the checkpoint."""
+"""Loading an engram table's shard of a safetensors checkpoint."""
 
 import os
+import sys
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
+from vllm.model_executor.model_loader.weight_utils import (
+    safetensors_weights_iterator,
+)
 from vllm.models.deepseek_v41.common import engram
 
-ROWS, DIM = 4096, 4096
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux", reason="direct I/O and mincore are Linux-only"
+)
 
-
-def _param(rows: int, dim: int, start: int, dtype: torch.dtype) -> torch.nn.Parameter:
-    param = torch.nn.Parameter(torch.zeros(rows, dim, dtype=dtype), requires_grad=False)
-    param.engram_vocab_start = start
-    return param
+# Above the size the loader reads directly, and more than one aligned buffer.
+ROWS, DIM = 32768, 4096
+SKIPPED_ROWS = 96
 
 
 @pytest.fixture
-def table(tmp_path):
-    """A table in a file behind a header, as in a shard, and what it holds."""
-    expected = torch.randint(0, 255, (ROWS, DIM), dtype=torch.uint8)
-    path = tmp_path / "table.bin"
-    header = b"h" * 1234
-    path.write_bytes(header + expected.numpy().tobytes())
-    mapped = torch.from_file(
-        str(path), shared=False, size=len(header) + ROWS * DIM, dtype=torch.uint8
-    )[len(header) :].view(ROWS, DIM)
-    return path, mapped, expected
+def checkpoint(tmp_path):
+    """A shard holding a table after a tensor of odd size, so that the table
+    starts off a block boundary, with none of it left in the page cache."""
+    expected = torch.randint(0, 256, (ROWS, DIM), dtype=torch.uint8)
+    path = tmp_path / "model-00001-of-00001.safetensors"
+    save_file({"a": torch.zeros(1237, dtype=torch.uint8), "table": expected}, path)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    return str(path), expected
 
 
-def test_a_table_in_memory_is_copied(table, monkeypatch):
-    _, mapped, expected = table
-    monkeypatch.setattr(engram, "_read_from_file", pytest.fail)
-    param = _param(rows=ROWS - 96, dim=DIM, start=96, dtype=torch.uint8)
-
-    engram._engram_head_shard_weight_loader(param, mapped)
-
-    assert torch.equal(param.data, expected[96:])
+def _mapped_table(path: str) -> torch.Tensor:
+    """The table as the model loader hands it to a weight loader."""
+    return dict(safetensors_weights_iterator([path], use_tqdm_on_load=False))["table"]
 
 
-def test_a_table_not_in_memory_is_read_from_its_file(table, monkeypatch):
-    path, mapped, expected = table
-    monkeypatch.setattr(engram, "_ENGRAM_READ_BYTES", 1 << 20)
-    monkeypatch.setattr(engram, "_resident_share", lambda pointer, nbytes: 0.0)
-    read = []
-    direct = engram._read_from_file
-
-    def reading(destination, file, offset):
-        # The test's filesystem may want aligned direct reads; read it buffered.
-        monkeypatch.setattr(os, "O_DIRECT", 0)
-        read.append((file, offset))
-        return direct(destination, file, offset)
-
-    monkeypatch.setattr(engram, "_read_from_file", reading)
-    param = _param(rows=ROWS - 96, dim=DIM, start=96, dtype=torch.uint8)
-
-    engram._engram_head_shard_weight_loader(param, mapped)
-
-    assert read == [(str(path), 1234 + 96 * DIM)]
-    assert torch.equal(param.data, expected[96:])
+def _param() -> torch.nn.Parameter:
+    param = torch.nn.Parameter(
+        torch.zeros(ROWS - SKIPPED_ROWS, DIM, dtype=torch.uint8), requires_grad=False
+    )
+    param.engram_vocab_start = SKIPPED_ROWS
+    return param
 
 
-def test_a_filesystem_that_cannot_read_directly_is_copied(table, monkeypatch):
-    _, mapped, expected = table
-    monkeypatch.setattr(engram, "_ENGRAM_READ_BYTES", 1 << 20)
-    monkeypatch.setattr(engram, "_resident_share", lambda pointer, nbytes: 0.0)
-
-    def failing(destination, file, offset):
-        destination.fill_(7)  # what a read that failed part-way leaves
-        return False
-
-    monkeypatch.setattr(engram, "_read_from_file", failing)
-    param = _param(rows=ROWS, dim=DIM, start=0, dtype=torch.uint8)
-
-    engram._engram_head_shard_weight_loader(param, mapped)
-
-    assert torch.equal(param.data, expected)
+def _resident(table: torch.Tensor) -> float:
+    return engram._resident_share(table.data_ptr(), table.numel())
 
 
-def test_the_backing_file_of_a_mapping(table):
-    path, mapped, _ = table
+def test_a_table_on_disk_is_loaded_without_filling_the_page_cache(checkpoint):
+    path, expected = checkpoint
+    table = _mapped_table(path)
+    # Opening the shard reads ahead a few MiB past its header, no more.
+    on_disk = _resident(table) < 0.5
+    param = _param()
 
-    assert engram._backing_file(mapped.data_ptr()) == (str(path), 1234)
+    engram._engram_head_shard_weight_loader(param, table)
+
+    assert torch.equal(param.data, expected[SKIPPED_ROWS:])
+    # A filesystem that keeps its files in memory (tmpfs) has nothing to show.
+    if on_disk:
+        assert _resident(table) < 0.5
+
+
+def test_a_table_in_memory_is_copied_from_it(checkpoint):
+    path, expected = checkpoint
+    table = _mapped_table(path)
+    assert torch.equal(table, expected)  # reads it into the page cache
+    assert _resident(table) == 1.0
+    param = _param()
+
+    engram._engram_head_shard_weight_loader(param, table)
+
+    assert torch.equal(param.data, expected[SKIPPED_ROWS:])
+    assert _resident(table) == 1.0
+
+
+def test_the_backing_file_of_a_mapping(checkpoint):
+    path, _ = checkpoint
+    table = _mapped_table(path)
+
+    found = engram._backing_file(table.data_ptr())
+
+    assert found is not None and found[0] == path
+    with open(path, "rb") as file:
+        file.seek(found[1])
+        assert file.read(DIM) == table[0].numpy().tobytes()
     assert engram._backing_file(torch.zeros(8).data_ptr()) is None
-
-
-def test_resident_share_does_not_touch_the_mapping(table):
-    _, mapped, expected = table
-    nbytes = ROWS * DIM
-
-    share = engram._resident_share(mapped.data_ptr(), nbytes)
-
-    assert 0.0 <= share <= 1.0
-    assert torch.equal(mapped, expected)
-    assert engram._resident_share(mapped.data_ptr(), nbytes) == 1.0
