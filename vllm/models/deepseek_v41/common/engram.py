@@ -39,6 +39,7 @@ import mmap
 import os
 import sys
 import tempfile
+import time
 import weakref
 from contextlib import ExitStack
 
@@ -608,11 +609,115 @@ class NgramHashState(nn.Module):
         return output
 
 
+# The bytes of an engram table read from its file at a time.
+_ENGRAM_READ_BYTES = 1 << 30
+# A table is read from its file, not copied from the mapping, when less than
+# this share of it is already in memory.
+_ENGRAM_RESIDENT_SHARE = 0.9
+
+
+def _backing_file(pointer: int) -> tuple[str, int] | None:
+    """The file, and the offset in it, that the mapping at ``pointer`` shows."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.rstrip("\n").split(maxsplit=5)
+                if len(fields) < 6:
+                    continue
+                start, _, end = fields[0].partition("-")
+                if int(start, 16) <= pointer < int(end, 16):
+                    path = fields[5]
+                    if not path.startswith("/") or path.endswith(" (deleted)"):
+                        return None
+                    return path, int(fields[2], 16) + pointer - int(start, 16)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _resident_share(pointer: int, nbytes: int) -> float:
+    """The share of a mapping's pages that are in memory, without touching
+    them; 1.0 where the kernel does not say."""
+    page = mmap.PAGESIZE
+    start = pointer // page * page
+    pages = (pointer + nbytes - start + page - 1) // page
+    try:
+        resident = (ctypes.c_ubyte * pages)()
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        if libc.mincore(start, pages * page, resident) != 0:
+            return 1.0
+    except (AttributeError, OSError, ValueError, MemoryError):
+        return 1.0
+    return int((np.frombuffer(resident, dtype=np.uint8) & 1).sum()) / pages
+
+
+def _read_from_file(destination: torch.Tensor, path: str, offset: int) -> bool:
+    """Fill ``destination`` with the file's bytes from ``offset``, past the
+    page cache. False, with ``destination`` in an unknown state, where the
+    filesystem does not read that way."""
+    if sys.platform != "linux":
+        return False
+    nbytes = destination.numel() * destination.element_size()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    except OSError:
+        return False
+    try:
+        target = memoryview(
+            (ctypes.c_char * nbytes).from_address(destination.data_ptr())
+        ).cast("B")
+        done = 0
+        while done < nbytes:
+            piece = target[done : done + _ENGRAM_READ_BYTES]
+            got = os.preadv(fd, [piece], offset + done)
+            if got <= 0:
+                return False
+            done += got
+    except OSError:
+        # A filesystem that wants direct reads aligned to its blocks.
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
 def _engram_head_shard_weight_loader(
     param: torch.nn.Parameter, loaded_weight: torch.Tensor
 ) -> None:
-    """Load this rank's complete head buckets."""
-    param.data.copy_(engram_head_shard(param, loaded_weight))
+    """Load this rank's complete head buckets.
+
+    A table of tens of GiB arrives memory-mapped, and copying it fills the page
+    cache, which a host with little RAM beyond the pinned tables cannot hold.
+    A table not yet in memory is therefore read from its file with direct I/O;
+    a filesystem that cannot read that way falls back to the copy.
+    """
+    shard = engram_head_shard(param, loaded_weight)
+    destination = param.data
+    nbytes = shard.numel() * shard.element_size()
+    if (
+        nbytes > _ENGRAM_READ_BYTES
+        and shard.dtype == destination.dtype
+        and shard.device.type == "cpu"
+        and destination.device.type == "cpu"
+        and shard.is_contiguous()
+        and destination.is_contiguous()
+        and _resident_share(shard.data_ptr(), nbytes) < _ENGRAM_RESIDENT_SHARE
+    ):
+        backing = _backing_file(shard.data_ptr())
+        if backing is not None:
+            started = time.perf_counter()
+            if _read_from_file(destination, *backing):
+                seconds = time.perf_counter() - started
+                logger.info(
+                    "Read an engram table of %.2f GiB from its file in %.1f s "
+                    "(%.0f MiB/s)",
+                    nbytes / 2**30,
+                    seconds,
+                    nbytes / 2**20 / max(seconds, 1e-9),
+                )
+                return
+    destination.copy_(shard)
 
 
 # Branching on SORTED at runtime intermittently crashes Triton 3.8's
