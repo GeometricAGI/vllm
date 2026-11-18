@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Loading an engram table's shard of a safetensors checkpoint."""
 
+import mmap
 import os
 import sys
 
@@ -52,6 +53,21 @@ def _param() -> torch.nn.Parameter:
     return param
 
 
+def _takes_direct_reads(path: str) -> bool:
+    """Whether the filesystem reads a whole block with ``O_DIRECT`` at all."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    except OSError:
+        return False
+    try:
+        with mmap.mmap(-1, mmap.PAGESIZE) as block:
+            return os.preadv(fd, [block], 0) == mmap.PAGESIZE
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
 def _resident(table: torch.Tensor) -> float:
     return engram._resident_share(table.data_ptr(), table.numel())
 
@@ -61,13 +77,15 @@ def test_a_table_on_disk_is_loaded_without_filling_the_page_cache(checkpoint):
     table = _mapped_table(path)
     # Opening the shard reads ahead a few MiB past its header, no more.
     on_disk = _resident(table) < 0.5
+    direct = _takes_direct_reads(path)
     param = _param()
 
     engram._engram_head_shard_weight_loader(param, table)
 
     assert torch.equal(param.data, expected[SKIPPED_ROWS:])
-    # A filesystem that keeps its files in memory (tmpfs) has nothing to show.
-    if on_disk:
+    # A filesystem that keeps its files in memory (tmpfs) has nothing to show,
+    # and one without direct I/O is copied from, which is the fallback.
+    if on_disk and direct:
         assert _resident(table) < 0.5
 
 
