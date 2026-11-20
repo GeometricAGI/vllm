@@ -589,6 +589,71 @@ def test_hybrid_mamba_partial_tail_owner_uses_cow_on_continue():
     assert get_block_hash(moved[0].block_hash) == partial_mamba_hash
     assert get_group_id(moved[0].block_hash) == 1
     assert moved[0].block_hash_num_tokens == 6
+    # The copy is still the prompt tail, evicted before other cached blocks.
+    assert manager.block_pool.low_priority_block_ids == {cow_copy.dst_block_id}
+
+
+def test_prompt_tail_entries_are_evicted_before_older_full_blocks():
+    """Prompt tails cached inside a block are rarely hit again, so pool
+    pressure evicts them before an older request's block-aligned prefix."""
+    hash_block_size = 4
+    block_size = 4 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=12,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=256,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    def run(request_id: str, tokens: list[int], chunk_ends: list[int]) -> int:
+        """Prefill in the chunks the scheduler would pick; return the hit."""
+        request = make_request(request_id, tokens, hash_block_size, sha256)
+        computed, num_computed, _ = manager.get_computed_blocks(request)
+        start = num_computed
+        for end in chunk_ends:
+            assert manager.allocate_slots(
+                request,
+                end - start,
+                num_computed if start == num_computed else 0,
+                computed if start == num_computed else None,
+            )
+            request.num_computed_tokens = start = end
+            manager.new_step_starts()
+        manager.free(request)
+        manager.new_step_starts()
+        return num_computed
+
+    prefix = list(range(2 * block_size))
+    run("prefix", prefix + [0], [32, 33])
+    # The prefill stops at the prompt tail, 20 tokens in, so it is cached.
+    run("tail", list(range(100, 100 + block_size + 6)), [16, 20, 22])
+    run("other", list(range(200, 200 + 2 * block_size)), [16, 32])
+
+    assert run("extend", prefix + list(range(300, 316)), [48]) == 2 * block_size
 
 
 def test_partial_hit_then_internal_checkpoint_uses_distinct_mamba_blocks():

@@ -184,6 +184,10 @@ class BlockPool:
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+        # Blocks whose only entry is a request's prompt tail inside the block.
+        # Most are never hit again, so they are evicted before other cached
+        # blocks.
+        self.low_priority_block_ids: set[int] = set()
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -491,6 +495,7 @@ class BlockPool:
         kv_cache_group_id: int,
         block_size: int,
         replace_existing_hashes: bool = False,
+        low_priority: bool = False,
     ) -> BlockHashWithGroupId | None:
         """Register a partial prefix-cache entry for an existing block.
 
@@ -521,6 +526,9 @@ class BlockPool:
             replace_existing_hashes: Whether the block contents were replaced
                 and all existing cache entries must be removed before the new
                 entry is registered.
+            low_priority: Whether the entry is a request's prompt tail, which
+                is evicted before other cached blocks while it is the block's
+                only entry.
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
@@ -558,6 +566,12 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        if (
+            low_priority
+            and num_tokens % block_size
+            and block.block_hash == block_hash_with_group_id
+        ):
+            self.low_priority_block_ids.add(block.block_id)
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
@@ -631,6 +645,7 @@ class BlockPool:
         self,
         block: KVCacheBlock,
     ) -> list[BlockHashWithGroupId]:
+        self.low_priority_block_ids.discard(block.block_id)
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
             block_hashes.append(block.block_hash)
@@ -699,9 +714,12 @@ class BlockPool:
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
+        low_priority = src_block.block_id in self.low_priority_block_ids
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+        if low_priority and dst_block.block_hash is not None:
+            self.low_priority_block_ids.add(dst_block.block_id)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -824,6 +842,7 @@ class BlockPool:
         """
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
+        blocks_low_priority = []
         blocks_to_evict_first = []
         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
         for block in ordered_blocks:
@@ -837,12 +856,15 @@ class BlockPool:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
+                elif block.block_id in self.low_priority_block_ids:
+                    blocks_low_priority.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)
 
         # Blocks to reuse first are prepended to the front of the free queue.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
+        self.free_block_queue.insert_low_priority_n(blocks_low_priority)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
@@ -890,6 +912,7 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        self.low_priority_block_ids.clear()
         if self._reuse_watchers:
             self._notify_reuse(
                 [self.blocks[block_id] for block_id in list(self._reuse_watchers)]

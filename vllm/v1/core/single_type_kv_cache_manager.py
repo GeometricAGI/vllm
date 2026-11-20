@@ -598,6 +598,7 @@ class SingleTypeKVCacheManager(ABC):
             num_tokens=boundary_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
+            low_priority=True,
         )
 
     @classmethod
@@ -2255,6 +2256,8 @@ class MambaManager(SingleTypeKVCacheManager):
                 kv_cache_group_id=self.kv_cache_group_id,
                 block_size=self.block_size,
                 replace_existing_hashes=True,
+                low_priority=is_prompt_checkpoint
+                and checkpoint_position != request.shared_prefix_boundary,
             )
         if num_tokens <= 0 or num_tokens % hash_block_size != 0:
             return None
@@ -2294,6 +2297,7 @@ class MambaManager(SingleTypeKVCacheManager):
             num_tokens=num_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
+            low_priority=num_tokens != request.shared_prefix_boundary,
         )
         if partial_hash is not None and num_tokens % self.block_size:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
