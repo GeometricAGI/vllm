@@ -724,6 +724,33 @@ def test_free_kv_cache_block_queue_popleft_n():
         assert block.next_free_block is None
 
 
+def test_free_kv_cache_block_queue_low_priority_blocks_go_before_appended():
+    """Low-priority blocks are popped after the blocks in front of them and
+    before every block appended at the back, also once that block leaves."""
+    blocks = [KVCacheBlock(block_id=i) for i in range(7)]
+    queue = FreeKVCacheBlockQueue([])
+    queue.append_n([blocks[0]])
+    queue.insert_low_priority_n([blocks[1]])
+    queue.prepend_n([blocks[2]])
+    queue.insert_low_priority_n([blocks[3]])
+    queue.append_n([blocks[4]])
+    # A prefix hit takes the oldest appended block out of the queue.
+    queue.remove(blocks[0])
+    queue.insert_low_priority_n([blocks[5]])
+    assert queue.get_all_free_blocks() == [blocks[i] for i in (2, 1, 3, 5, 4)]
+
+    assert queue.popleft_n(4) == [blocks[i] for i in (2, 1, 3, 5)]
+    queue.insert_low_priority_n([blocks[6]])
+    assert queue.popleft() is blocks[6]
+    assert queue.popleft() is blocks[4]
+
+    queue.insert_low_priority_n([blocks[0]])
+    queue.append_n([blocks[1]])
+    queue.insert_low_priority_n([blocks[2]])
+    assert queue.get_all_free_blocks() == [blocks[0], blocks[2], blocks[1]]
+    assert queue.num_free_blocks == 3
+
+
 @pytest.mark.parametrize("num_blocks", [1, 2, 16])
 def test_free_kv_cache_block_queue_popleft_n_drain_and_refill(num_blocks):
     """Draining a batch must leave the sentinels ready for reuse."""

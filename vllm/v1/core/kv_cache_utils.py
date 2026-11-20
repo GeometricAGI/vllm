@@ -273,6 +273,10 @@ class FreeKVCacheBlockQueue:
     Note that we maintain this order by reversing the block order when free
     blocks of a request. This operation is outside of this class.
 
+    Low-priority blocks go just before ``low_priority_end``, the oldest block
+    appended at the back, so they are evicted after every block in front of
+    them and before any block appended since.
+
     Args:
         blocks: A list of KVCacheBlock objects.
 
@@ -308,6 +312,18 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
 
+        # The first block appended at the back that is still in the queue, or
+        # None if there is none.
+        self.low_priority_end: KVCacheBlock | None = None
+
+    def _unlinking(self, block: KVCacheBlock) -> None:
+        """Move ``low_priority_end`` past ``block``, which leaves the queue."""
+        if block is self.low_priority_end:
+            next_block = block.next_free_block
+            self.low_priority_end = (
+                None if next_block is self.fake_free_list_tail else next_block
+            )
+
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
 
@@ -332,6 +348,7 @@ class FreeKVCacheBlockQueue:
                 "Invalid block found in popleft() "
                 "which doesn't have a valid next_free_block"
             )
+        self._unlinking(first_block)
 
         # Connect fake_head and the next block of first_block (i.e. second block
         # or fake tail).
@@ -363,6 +380,7 @@ class FreeKVCacheBlockQueue:
         if n == 1:
             assert curr_block is not None
             next_block = curr_block.next_free_block
+            self._unlinking(curr_block)
             curr_block.prev_free_block = None
             curr_block.next_free_block = None
             if next_block is not None:
@@ -372,14 +390,20 @@ class FreeKVCacheBlockQueue:
 
         # Pop n blocks from the head of the list
         ret = []
+        low_priority_end = self.low_priority_end
         for _ in range(n):
             assert curr_block is not None
             ret.append(curr_block)
             last_block = curr_block
             curr_block = curr_block.next_free_block
+            if last_block is low_priority_end:
+                low_priority_end = curr_block
             # Reset prev_free_block and next_free_block of all popped blocks
             last_block.prev_free_block = None
             last_block.next_free_block = None
+        self.low_priority_end = (
+            None if low_priority_end is self.fake_free_list_tail else low_priority_end
+        )
 
         if curr_block is not None:
             # The queue is not empty, connect the fake head to
@@ -401,6 +425,7 @@ class FreeKVCacheBlockQueue:
             # This should not happen if the block is from the free list.
             # It indicates a bug in the caller's logic.
             raise RuntimeError(f"remove() called on an invalid block: {block}")
+        self._unlinking(block)
 
         # Link the previous block to the next block.
         prev_block.next_free_block = next_block
@@ -433,6 +458,8 @@ class FreeKVCacheBlockQueue:
         block.next_free_block = tail
         tail.prev_free_block = block
 
+        if self.low_priority_end is None:
+            self.low_priority_end = block
         self.num_free_blocks += 1
 
     def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
@@ -453,6 +480,25 @@ class FreeKVCacheBlockQueue:
 
         prev_block.next_free_block = first_block
         first_block.prev_free_block = prev_block
+
+        self.num_free_blocks += len(blocks)
+
+    def insert_low_priority_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Put blocks before every block appended at the back, after the older
+        low-priority blocks and everything else in front."""
+        if not blocks:
+            return
+
+        next_block = self.low_priority_end or self.fake_free_list_tail
+        prev_block = next_block.prev_free_block
+        assert prev_block is not None
+        for block in blocks:
+            block.prev_free_block = prev_block
+            prev_block.next_free_block = block
+            prev_block = block
+
+        prev_block.next_free_block = next_block
+        next_block.prev_free_block = prev_block
 
         self.num_free_blocks += len(blocks)
 
@@ -481,6 +527,8 @@ class FreeKVCacheBlockQueue:
         last_block.next_free_block = tail
         tail.prev_free_block = last_block
 
+        if self.low_priority_end is None:
+            self.low_priority_end = blocks[0]
         self.num_free_blocks += len(blocks)
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
