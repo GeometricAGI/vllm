@@ -290,7 +290,8 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
 
 
 def test_mamba_align_split_when_block_exceeds_scheduling_budget():
-    """Sub-block chunks make progress only when no step can fit a full block."""
+    """A chunk that cannot reach its block boundary advances sub-block, even
+    when the step limit fits a full block, and re-aligns at that boundary."""
     block_size = 11392
     token_budget = 8192
     prompt_length = 30000
@@ -310,7 +311,7 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     split = Scheduler._mamba_block_aligned_split
 
     mock.max_num_scheduled_tokens = block_size
-    assert split(self=mock, request=req, num_new_tokens=token_budget) == 0
+    assert split(self=mock, request=req, num_new_tokens=token_budget) == token_budget
     mock.max_num_scheduled_tokens = token_budget
 
     scheduled_chunks = []
