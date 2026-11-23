@@ -451,9 +451,9 @@ class Scheduler(SchedulerInterface):
 
         In "align" cache mode reusable SSM states are materialized at block
         boundaries, plus mandatory early stops (the prompt's partial-tail hash
-        boundary, a detected shared-prefix junction). If a block is larger
-        than the configured prefill chunk limit, intermediate chunks keep
-        private running state until they reach the next cacheable position.
+        boundary, a detected shared-prefix junction). A chunk that cannot
+        reach the next block boundary keeps private running state until a
+        later chunk reaches it.
         """
         start = (
             request.num_computed_tokens
@@ -502,15 +502,12 @@ class Scheduler(SchedulerInterface):
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
-        # to the boundary. A block too wide for one chunk advances sub-block
-        # and re-aligns at the next boundary.
+        # to the boundary. A chunk that cannot reach the next boundary (a
+        # block wider than the chunk limit, or a step budget that decodes cut
+        # below a block) advances sub-block and re-aligns at that boundary.
         if end < prefill_end:
-            max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
-            if long_prefill_threshold > 0:
-                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
-            if aligned_end > start or block_size <= max_prefill_tokens:
+            if aligned_end > start:
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
@@ -1178,7 +1175,8 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
-                            break
+                            skip_request(request_queue)
+                            continue
                         if (
                             pad_spec_decode
                             and num_new_tokens != 1 + self.num_spec_tokens
