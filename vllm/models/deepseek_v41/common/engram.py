@@ -39,6 +39,7 @@ import mmap
 import os
 import sys
 import tempfile
+import time
 import weakref
 from contextlib import ExitStack
 
@@ -68,6 +69,12 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.models.deepseek_v41.common.engram_store import (
+    NodeSharedEngramStorage,
+    PackedEngramStorage,
+    engram_head_shard,
+    register_host_memory,
+)
 from vllm.models.deepseek_v41.common.ops.query_quant import (
     can_fuse_query_quant,
     mxfp8_scale_bytes,
@@ -602,19 +609,158 @@ class NgramHashState(nn.Module):
         return output
 
 
+# A table of at least this many bytes is read from its file when it is not in
+# memory already.
+_ENGRAM_DIRECT_BYTES = 64 << 20
+# The bytes of an engram table read from its file at a time.
+_ENGRAM_READ_BYTES = 1 << 30
+# The buffer, and the block size it is a multiple of, that aligned reads go
+# through on a filesystem whose direct reads must be block-aligned.
+_ENGRAM_ALIGNED_BYTES = 64 << 20
+_ENGRAM_BLOCK_BYTES = 4096
+# A table is read from its file, not copied from the mapping, when less than
+# this share of it is already in memory.
+_ENGRAM_RESIDENT_SHARE = 0.9
+
+
+def _backing_file(pointer: int) -> tuple[str, int] | None:
+    """The file, and the offset in it, that the mapping at ``pointer`` shows."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.rstrip("\n").split(maxsplit=5)
+                if len(fields) < 6:
+                    continue
+                start, _, end = fields[0].partition("-")
+                if int(start, 16) <= pointer < int(end, 16):
+                    path = fields[5]
+                    if not path.startswith("/") or path.endswith(" (deleted)"):
+                        return None
+                    return path, int(fields[2], 16) + pointer - int(start, 16)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _resident_share(pointer: int, nbytes: int) -> float:
+    """The share of a mapping's pages that are in memory, without touching
+    them; 1.0 where the kernel does not say."""
+    page = mmap.PAGESIZE
+    start = pointer // page * page
+    pages = (pointer + nbytes - start + page - 1) // page
+    try:
+        resident = (ctypes.c_ubyte * pages)()
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        if libc.mincore(start, pages * page, resident) != 0:
+            return 1.0
+    except (AttributeError, OSError, ValueError, MemoryError):
+        return 1.0
+    return int((np.frombuffer(resident, dtype=np.uint8) & 1).sum()) / pages
+
+
+def _read_unaligned(fd: int, target: memoryview, offset: int) -> bool:
+    """Read straight into ``target``; False where the filesystem refuses a
+    direct read at an unaligned offset or address (it raises ``EINVAL``)."""
+    done = 0
+    try:
+        while done < len(target):
+            got = os.preadv(
+                fd, [target[done : done + _ENGRAM_READ_BYTES]], offset + done
+            )
+            if got <= 0:
+                return False
+            done += got
+    except OSError:
+        return False
+    return True
+
+
+def _read_aligned(fd: int, target: memoryview, offset: int) -> bool:
+    """Read whole blocks into a page-aligned buffer and copy out of it, for a
+    filesystem whose direct reads must be block-aligned."""
+    done = 0
+    try:
+        with (
+            mmap.mmap(-1, _ENGRAM_ALIGNED_BYTES) as buffer,
+            memoryview(buffer) as blocks,
+        ):
+            while done < len(target):
+                start = (offset + done) // _ENGRAM_BLOCK_BYTES * _ENGRAM_BLOCK_BYTES
+                skip = offset + done - start
+                got = os.preadv(fd, [blocks], start)
+                if got <= skip:
+                    return False
+                take = min(got - skip, len(target) - done)
+                target[done : done + take] = blocks[skip : skip + take]
+                done += take
+    except OSError:
+        return False
+    return True
+
+
+def _read_from_file(destination: torch.Tensor, path: str, offset: int) -> bool:
+    """Fill ``destination`` with the file's bytes from ``offset``, past the
+    page cache. False, with ``destination`` in an unknown state, where the
+    filesystem has no direct I/O."""
+    if sys.platform != "linux":
+        return False
+    nbytes = destination.numel() * destination.element_size()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    except OSError:
+        return False
+    try:
+        target = memoryview(
+            (ctypes.c_char * nbytes).from_address(destination.data_ptr())
+        ).cast("B")
+        return _read_unaligned(fd, target, offset) or _read_aligned(fd, target, offset)
+    finally:
+        os.close(fd)
+
+
 def _engram_head_shard_weight_loader(
     param: torch.nn.Parameter, loaded_weight: torch.Tensor
 ) -> None:
-    """Load this rank's complete head buckets. ue8m0 scales arrive as
-    float8_e8m0fnu; keep the raw bytes (the param stores uint8)."""
-    part_rows = param.shape[0]
-    if loaded_weight.dtype == torch.float8_e8m0fnu:
-        loaded_weight = loaded_weight.view(torch.uint8)
-    shard = loaded_weight.narrow(0, param.engram_vocab_start, part_rows)
-    assert shard.shape == param.shape, (
-        f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
-    )
-    param.data.copy_(shard)
+    """Load this rank's complete head buckets.
+
+    A table of tens of GiB arrives memory-mapped, and copying it fills the page
+    cache, which a host with little RAM beyond the pinned tables cannot hold.
+    A table not yet in memory is therefore read from its file with direct I/O;
+    a filesystem without it falls back to the copy.
+    """
+    shard = engram_head_shard(param, loaded_weight)
+    destination = param.data
+    nbytes = shard.numel() * shard.element_size()
+    if (
+        nbytes >= _ENGRAM_DIRECT_BYTES
+        and shard.dtype == destination.dtype
+        and shard.device.type == "cpu"
+        and destination.device.type == "cpu"
+        and shard.is_contiguous()
+        and destination.is_contiguous()
+        and _resident_share(shard.data_ptr(), nbytes) < _ENGRAM_RESIDENT_SHARE
+    ):
+        backing = _backing_file(shard.data_ptr())
+        if backing is not None:
+            started = time.perf_counter()
+            if _read_from_file(destination, *backing):
+                seconds = time.perf_counter() - started
+                logger.info(
+                    "Read an engram table of %.2f GiB from its file in %.1f s "
+                    "(%.0f MiB/s)",
+                    nbytes / 2**30,
+                    seconds,
+                    nbytes / 2**20 / max(seconds, 1e-9),
+                )
+                return
+            logger.warning(
+                "Could not read an engram table of %.2f GiB from %s with direct "
+                "I/O; copying it through the page cache.",
+                nbytes / 2**30,
+                backing[0],
+            )
+    destination.copy_(shard)
 
 
 # Branching on SORTED at runtime intermittently crashes Triton 3.8's
@@ -778,7 +924,7 @@ def gather_engram_hashes(
     return dp_group.all_gather(hash_ids, dim=0)
 
 
-class DPSharedEngramStorage:
+class DPSharedEngramStorage(PackedEngramStorage):
     """Registered host weights shared by a node-local DP group with one writer."""
 
     def __init__(
@@ -787,9 +933,7 @@ class DPSharedEngramStorage:
         self.group = group
         weight_bytes = num_rows * dim
         storage = self._allocate(weight_bytes + weight_bytes // block_size)
-        self.weight = storage[:weight_bytes].view(torch.float8_e4m3fn).view(-1, dim)
-        self.weight_scale_inv = storage[weight_bytes:].view(-1, dim // block_size)
-        self._views: tuple[torch.Tensor, torch.Tensor] | None = None
+        super().__init__(storage, num_rows, dim, block_size)
 
     def _allocate(self, num_bytes: int) -> torch.Tensor:
         """Map and register one physical allocation across a node-local DP group."""
@@ -817,18 +961,7 @@ class DPSharedEngramStorage:
                 with open(path, "r+b") as file:
                     mapping = mmap.mmap(file.fileno(), num_bytes, flags=mmap.MAP_SHARED)
                 owner = np.frombuffer(mapping, dtype=np.uint8)
-                pointer = owner.ctypes.data
-                tensor = torch.from_numpy(owner)
-                result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)
-                if result.value != 0:
-                    raise RuntimeError(f"cudaHostRegister failed: {result}")
-                finalizer = weakref.finalize(owner, self._unregister, mapping, pointer)
-                finalizer.atexit = False  # type: ignore[misc]
-                # The UVA helper otherwise allocates a private pinned copy.
-                if not tensor.is_pinned():
-                    raise RuntimeError(
-                        "cudaHostRegister did not pin the shared Engram mapping"
-                    )
+                tensor = register_host_memory(owner, mapping)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
 
@@ -849,14 +982,6 @@ class DPSharedEngramStorage:
             assert tensor is not None
             return tensor
 
-    @staticmethod
-    def _unregister(mapping: mmap.mmap, pointer: int) -> None:
-        # Torch storage retains the numpy owner, including through cached UVA views.
-        # Keep its mmap alive until CUDA has released the registration.
-        result = torch.cuda.cudart().cudaHostUnregister(pointer)
-        if result.value != 0:
-            logger.warning("Engram cudaHostUnregister failed: %s", result)
-
     def load_weight(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
     ) -> None:
@@ -865,21 +990,6 @@ class DPSharedEngramStorage:
         # Read order may differ across ranks. Equal load counts ensure all shared
         # weights are ready after the last weight-loader call returns.
         torch.distributed.barrier(group=self.group.cpu_group)
-
-    def get_views(
-        self, weight: torch.Tensor, scales: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (weight.data_ptr(), scales.data_ptr()) != (
-            self.weight.data_ptr(),
-            self.weight_scale_inv.data_ptr(),
-        ):
-            raise RuntimeError("Shared Engram parameter storage must not be replaced")
-        if self._views is None:
-            self._views = (
-                get_accelerator_view_from_cpu_tensor(self.weight),
-                get_accelerator_view_from_cpu_tensor(self.weight_scale_inv),
-            )
-        return self._views
 
 
 def can_share_engram_tables(layout: EngramLayout, block_size: int = 32) -> bool:
@@ -929,25 +1039,13 @@ def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
     owner = np.frombuffer(mapping, dtype=np.uint8)
     # Fault the pages in before CUDA pins them, so they can be huge.
     owner[:: mmap.PAGESIZE] = 0
-    tensor = torch.from_numpy(owner)
-    pointer = tensor.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(pointer, num_bytes, 0)
-    if result.value != 0:
+    try:
+        return register_host_memory(owner, mapping)
+    except RuntimeError as exc:
         logger.warning(
-            "Engram cudaHostRegister failed (%s); using pinned memory.", result
+            "Engram huge-page registration failed (%s); using pinned memory.", exc
         )
         return None
-    # Tensor views retain owner; its finalizer retains mapping until unregister.
-    finalizer = weakref.finalize(
-        owner, DPSharedEngramStorage._unregister, mapping, pointer
-    )
-    finalizer.atexit = False  # type: ignore[misc]
-    if not tensor.is_pinned():
-        logger.warning(
-            "CUDA did not recognize Engram registration; using pinned memory."
-        )
-        return None
-    return tensor
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -958,7 +1056,7 @@ class ParallelEngramEmbedding(nn.Module):
     """
 
     _weight_loader = staticmethod(_engram_head_shard_weight_loader)
-    _shared_memory: DPSharedEngramStorage | None = None
+    _shared_memory: DPSharedEngramStorage | NodeSharedEngramStorage | None = None
     _packed: torch.Tensor | None = None
 
     def __init__(
@@ -970,6 +1068,8 @@ class ParallelEngramEmbedding(nn.Module):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        shared_store: str | None = None,
+        store_identity: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
@@ -977,6 +1077,8 @@ class ParallelEngramEmbedding(nn.Module):
         self.cpu_offload = cpu_offload
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
+        self.shared_store = shared_store
+        self.store_identity = store_identity
         self.dp_size = get_engram_dp_size()
         if dp_shared_memory:
             if not cpu_offload:
@@ -1069,7 +1171,11 @@ class ParallelEngramEmbedding(nn.Module):
                 self.part_num_embeddings,
                 dim,
                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
-                "shared across DP replicas" if dp_shared_memory else "per rank",
+                "shared across DP replicas"
+                if dp_shared_memory
+                else f"shared across servers via {shared_store}"
+                if shared_store is not None
+                else "per rank",
             )
 
     def _get_shard_info(self) -> tuple[int, int]:
@@ -1119,6 +1225,23 @@ class ParallelEngramEmbedding(nn.Module):
             self._shared_memory = storage
             self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
+        if self.shared_store is not None:
+            assert self.store_identity is not None
+            node_storage = NodeSharedEngramStorage(
+                self.shared_store,
+                {
+                    **self.store_identity,
+                    "rows": [self.vocab_start_idx, self.vocab_end_idx],
+                    "dim": self.dim,
+                    "block_size": self.block_size,
+                },
+                self.part_num_embeddings,
+                self.dim,
+                self.block_size,
+            )
+            self._shared_memory = node_storage
+            self._weight_loader = node_storage.load_weight
+            return node_storage.weight, node_storage.weight_scale_inv
         # pin_memory rounds up to a power of two. ROCm pins huge pages either way.
         if self.use_thp or current_platform.is_rocm():
             weight_bytes = self.part_num_embeddings * self.dim
@@ -1622,7 +1745,9 @@ class Engram(nn.Module):
         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
         # suffix rule.
-        self.embed_tokens = self._create_embedding(layout, layer_hash_index)
+        self.embed_tokens = self._create_embedding(
+            layout, layer_hash_index, f"{prefix}.embed_tokens"
+        )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         # Without sequence parallelism every TP rank holds every token, so
         # shard the output columns instead of replicating the projection.
@@ -1649,10 +1774,14 @@ class Engram(nn.Module):
         self._init_staging(max_tokens, layout.head_dim)
 
     def _create_embedding(
-        self, layout: EngramLayout, layer_hash_index: int
+        self, layout: EngramLayout, layer_hash_index: int, prefix: str
     ) -> ParallelEngramEmbedding:
-        engram_config = get_current_vllm_config().engram_config
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
         assert engram_config is not None
+        store_identity = None
+        if engram_config.shared_store is not None:
+            store_identity = self._store_identity(vllm_config, prefix)
         return ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
@@ -1660,7 +1789,36 @@ class Engram(nn.Module):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            shared_store=engram_config.shared_store,
+            store_identity=store_identity,
         )
+
+    @staticmethod
+    def _store_identity(vllm_config: VllmConfig, prefix: str) -> dict[str, object]:
+        """What makes this layer's table the same across servers sharing it."""
+        from vllm.model_executor.model_loader import (
+            _LOAD_FORMAT_TO_MODEL_LOADER,
+            DefaultModelLoader,
+        )
+
+        load_format = vllm_config.load_config.load_format
+        # Other loaders (dummy, sharded_state, ...) write parameters directly
+        # rather than through NodeSharedEngramStorage.load_weight, which would
+        # fault on the read-only shared mapping.
+        if _LOAD_FORMAT_TO_MODEL_LOADER.get(load_format) is not DefaultModelLoader:
+            raise ValueError(
+                f"Engram shared_store cannot be used with load_format={load_format!r}"
+            )
+        model_config = vllm_config.model_config
+        return {
+            "model": model_config.model,
+            "revision": model_config.revision,
+            "layer": prefix,
+            "tp": [
+                get_tensor_model_parallel_rank(),
+                get_tensor_model_parallel_world_size(),
+            ],
+        }
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
         # Persistent storage keeps lookup addresses stable across graph replays.

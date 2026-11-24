@@ -1,14 +1,16 @@
-"""v3 HummingIndexedExperts.apply: INT3 (group 128) routed experts, decode path m <= 64 in new TKDSL kernels.
+"""v3 HummingIndexedExperts.apply: INT3 (group 128) routed experts, decode path m <= 128 in new TKDSL kernels.
 
-Decode (m <= 64): routing prep (per-expert pick lists, a list of active (expert, 4-token pass) work units) ->
-INT3 gate/up grouped GEMV -> clamped SwiGLU -> INT3 down grouped GEMV (top-k weight applied) -> bf16.  The GEMVs are
-stream-K: every CTA takes one contiguous, equal range of 128-K stages over (pass, N tile, K group), so the grid ends
-together whatever the routing.  m > 64 calls #54's apply (its tcgen05 prefill path) unchanged.
+Decode (m <= 128, which covers DSpark verify steps of 32 sequences x 4 tokens): routing prep (per-expert pick
+lists, a list of active (expert, 4-token pass) work units) -> INT3 gate/up grouped GEMV -> clamped SwiGLU -> INT3
+down grouped GEMV (top-k weight applied) -> bf16.  The GEMVs are stream-K: every CTA takes one contiguous, equal range
+of 128-K stages over (pass, N tile, K group), so the grid ends together whatever the routing.  m > 128 calls #54's
+apply unchanged.
 """
 
 import torch
 from tkdsl import nvidia as tk  # noqa: F401
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import *  # noqa: F401,F403
 from vllm.model_executor.layers.fused_moe.experts import fused_humming_moe_tkdsl as _v2
 
@@ -16,8 +18,8 @@ K1, N1 = 5120, 4608
 I2 = 2304
 K2, N2 = 2304, 5120
 TOPK = 6
-CAP = 64          # max picks per expert on the decode path (m <= 64, ids distinct per token)
-DECODE_MAX = 64
+DECODE_MAX = 128
+CAP = DECODE_MAX  # max picks per expert on the decode path: ids are distinct per token, so at most m <= DECODE_MAX
 
 WPR1 = N1 * 3 // 2               # u32 words per 16-K row of w13
 W1E = (K1 // 16) * WPR1          # words per expert of w13
@@ -579,7 +581,8 @@ def apply(self, output, hidden_states, w1, w2, topk_weights, topk_ids, activatio
           a1q_scale, a2_scale, workspace13, workspace2, expert_tokens_meta, apply_router_weight_on_input) -> None:
     m = topk_ids.size(0)
     if (m <= DECODE_MAX and expert_tokens_meta is None and expert_map is None and a1q_scale is None
-            and w1.size(0) <= 512 and topk_ids.size(1) == TOPK):
+            and w1.size(0) <= 512 and topk_ids.size(1) == TOPK and activation == MoEActivation.SILU
+            and not apply_router_weight_on_input and hidden_states.dtype == torch.bfloat16):
         x = hidden_states.view(-1, hidden_states.size(-1))
         nexp = w1.size(0)
         dev = x.device

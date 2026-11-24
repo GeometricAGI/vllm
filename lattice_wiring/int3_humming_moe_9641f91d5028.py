@@ -157,6 +157,18 @@ def compare(candidate, reference, case):
 baseline = HummingIndexedExperts.apply
 
 
+def _offset_binary_int3(experts):
+    """The kernels decode offset-binary uint3 codes (c - 4). Humming recodes a layer with no code 0 as
+    sign-magnitude (same packed width), which they would misread, so such a layer stays on Humming."""
+    ok = experts.__dict__.get("_lattice_offset_binary_int3")
+    if ok is None:
+        qc = experts.quant_config
+        ok = all(str(getattr(getattr(qc, f"{w}_humming_config", None), "b_dtype", None)) == "uint3"
+                 for w in ("w1", "w2"))
+        experts._lattice_offset_binary_int3 = ok
+    return ok
+
+
 def wire(function, original, call_site):
     """The new apply for this model's INT3 layers; anything else goes back to the original."""
     def apply(self, output, hidden_states, w1, w2, topk_weights, topk_ids, activation,
@@ -176,6 +188,7 @@ def wire(function, original, call_site):
             and topk_ids.size(1) == TOPK
             and self.num_experts == E
             and w1.size(0) == E
+            and _offset_binary_int3(self)
             and (expert_tokens_meta is None or expert_tokens_meta.psum_recv_per_rank is None)
         )
         return (function if handled else original)(*args)
