@@ -169,7 +169,8 @@ def _split(
         (3602, 2000, False, MAMBA_BLOCK_SIZE),
         (3602, 3602, True, 3602),
         (2002, 2002, True, 2002),
-        (3602, 512, True, 0),
+        # A budget under one block advances sub-block instead of stalling.
+        (3602, 512, True, 512),
         (3602, 1700, True, MAMBA_BLOCK_SIZE),
     ],
 )
@@ -236,8 +237,8 @@ def _run_chunked_prefill(
 ) -> dict[int, int]:
     """Prefill `request`, one step per entry in `budgets`.
 
-    A zero-token split means the budget cannot fund an aligned chunk; the
-    scheduler defers the request to a later step, so this does too.
+    Every step must make progress: a budget under one block advances
+    sub-block rather than stalling the request.
 
     Returns physical mamba block id -> the token offset of the state it holds,
     mirroring the GDN kernel: the running slot ends up at the chunk end.
@@ -254,8 +255,7 @@ def _run_chunked_prefill(
         num_new = _split(
             request, min(request.num_tokens - computed, budget), **split_kwargs
         )
-        if num_new == 0:
-            continue
+        assert num_new > 0, f"no progress at {computed} with budget {budget}"
         assert (
             manager.allocate_slots(request, num_new, num_lookahead_tokens=NUM_SPEC)
             is not None
@@ -356,8 +356,9 @@ def test_lookahead_split_caches_partial_tail_boundary(lookahead: int) -> None:
 
 
 @pytest.mark.parametrize("first_chunk", [800, 900, 1599, 1601, 2000])
-def test_intermediate_chunk_ends_stay_block_aligned(first_chunk: int) -> None:
-    """Every non-final prefill chunk must end on a mamba block boundary."""
+def test_intermediate_chunks_cache_only_exact_states(first_chunk: int) -> None:
+    """A first chunk that ends short of a block, or past one, re-aligns at a
+    block boundary before any later chunk crosses it."""
     _prefill(PROMPT_LEN, budgets=[first_chunk, PROMPT_LEN, PROMPT_LEN])
 
 

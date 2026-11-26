@@ -8405,13 +8405,15 @@ def test_cached_reservations_admit_like_on_demand_sum(spec, num_spec_tokens):
     }
 
 
-def _create_hybrid_mamba_connector_scheduler(
-    matched_tokens: int,
+def _create_hybrid_mamba_scheduler(
+    matched_tokens: int | None,
     block_size: int = 16,
     num_blocks: int = 100,
     supports_divergent_hits: bool = True,
+    max_num_batched_tokens: int = 8192,
 ) -> Scheduler:
-    """FA + Mamba ("align" cache mode) scheduler with a MockKVConnector."""
+    """FA + Mamba ("align" cache mode) scheduler, with a MockKVConnector unless
+    `matched_tokens` is None."""
     model_config = ModelConfig(
         model="facebook/opt-125m",
         trust_remote_code=True,
@@ -8422,7 +8424,7 @@ def _create_hybrid_mamba_connector_scheduler(
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=4,
-            max_num_batched_tokens=8192,
+            max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=8192,
             enable_chunked_prefill=True,
             is_encoder_decoder=False,
@@ -8434,7 +8436,9 @@ def _create_hybrid_mamba_connector_scheduler(
             enable_prefix_caching=True,
             mamba_cache_mode="align",
         ),
-        kv_transfer_config=KVTransferConfig(
+        kv_transfer_config=None
+        if matched_tokens is None
+        else KVTransferConfig(
             kv_connector="MockKVConnector",
             kv_role="kv_both",
             kv_connector_extra_config={
@@ -8528,7 +8532,7 @@ def test_hybrid_per_group_hit_divergence_with_connector(
     every group is consistent at.
     """
     block_size = 16
-    scheduler = _create_hybrid_mamba_connector_scheduler(matched_tokens)
+    scheduler = _create_hybrid_mamba_scheduler(matched_tokens)
     manager = scheduler.kv_cache_manager
     assert isinstance(manager.coordinator, HybridKVCacheCoordinator)
 
@@ -8568,7 +8572,7 @@ def test_hybrid_divergent_hit_fallback_is_capped_at_retained_auxiliary_outputs(
     max_cache_hit, expected_num_computed
 ):
     block_size = 16
-    scheduler = _create_hybrid_mamba_connector_scheduler(16)
+    scheduler = _create_hybrid_mamba_scheduler(16)
     manager = scheduler.kv_cache_manager
     _, mamba_ids = _seed_hybrid_prefix(manager, 4, block_size)
     manager.block_pool.evict_blocks({mamba_ids[1], mamba_ids[2], mamba_ids[3]})
@@ -8614,7 +8618,7 @@ def test_hybrid_fa_deeper_hit_respects_connector_lookup_policy(
     consistent boundary instead.
     """
     block_size = 16
-    scheduler = _create_hybrid_mamba_connector_scheduler(
+    scheduler = _create_hybrid_mamba_scheduler(
         matched_tokens,
         supports_divergent_hits=supports_divergent_local_hybrid_hits,
     )
@@ -8645,6 +8649,50 @@ def test_hybrid_fa_deeper_hit_respects_connector_lookup_policy(
     output = scheduler.schedule()
     [new_req] = output.scheduled_new_reqs
     assert new_req.num_computed_tokens == expected_num_computed
+
+
+def test_mamba_align_prefill_advances_when_decodes_leave_under_a_block():
+    """With the step budget equal to the Mamba block size, a running decode
+    leaves less than a block for prefill. The prefill must advance sub-block
+    and re-align at the boundary instead of taking 0 tokens, which stalled it
+    and every waiting request behind it.
+    """
+    block_size = 16
+    scheduler = _create_hybrid_mamba_scheduler(
+        None, block_size=block_size, max_num_batched_tokens=block_size
+    )
+    [decode] = create_requests(1, 8, block_size=block_size, req_ids=["decode"])
+    [prefill] = create_requests(
+        1, 4 * block_size, block_size=block_size, req_ids=["prefill"]
+    )
+    [short] = create_requests(1, 4, block_size=block_size, req_ids=["short"])
+
+    def step(sampling: set[str]) -> dict[str, int]:
+        output = scheduler.schedule()
+        req_ids = list(output.num_scheduled_tokens)
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                sampled_token_ids=[[1] if r in sampling else [] for r in req_ids],
+            ),
+        )
+        return output.num_scheduled_tokens
+
+    scheduler.add_request(decode)
+    assert step({decode.request_id}) == {decode.request_id: 8}
+
+    scheduler.add_request(prefill)
+    scheduler.add_request(short)
+    assert step({decode.request_id}) == {
+        decode.request_id: 1,
+        prefill.request_id: block_size - 1,
+    }
+    assert step({decode.request_id, short.request_id}) == {
+        decode.request_id: 1,
+        prefill.request_id: 1,
+        short.request_id: 4,
+    }
 
 
 def _make_encoder_instance_request(scheduler, text_prefix=8, image_tokens=16):
